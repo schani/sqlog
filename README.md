@@ -85,9 +85,55 @@ All 48 runs (S2 and in-memory): every node identical, money conserved. With 10% 
 - **Latency floor is two round trips** with several writers: the append, then reading the other writers' records that landed before it. One writer needs only the append.
 - Throughput still falls with writers because each writer batches only its own clients; total clients stay at 2,000.
 
+## SQL mode: SQLite over a command log and an effect log
+
+`src/sql/`. Two S2 streams per database: `<stream>-cmd` and `<stream>-fx`.
+
+- **Writers** append SQL transactions to the command log, unconditionally, and report the position. They keep no state.
+- **Producers** execute command records on SQLite and append the changed pages plus every transaction's outcome to the effect log, conditionally at the next effect position. With several producers the first append wins; losers discard their work, apply the winner's effect and, when it covers the same commands, compare digests.
+- **Readers** (every node) apply effects to a versioned in-memory page store and never run SQL writes. Queries see snapshots of it.
+- Clients get outcomes only from the effect log, so no client sees a result that isn't canonical. A transaction is committed once its command is durable; its outcome follows with the effect.
+
+Details:
+
+- **VFS** (`vfs.rs`): SQLite reads and writes pages through a custom VFS backed by the page store. The producer's connection writes into a pending overlay that becomes the next version when its effect lands. Query connections pin the latest version when SQLite takes its shared lock, so a read transaction sees one version while new ones are installed.
+- **Execution:** one SQLite transaction per command record; each client transaction runs in a savepoint, so a failing one (constraint violation, SQL error) aborts alone. `BEGIN`, `COMMIT`, `PRAGMA`, `ATTACH`, `VACUUM` and similar are rejected.
+- **Dedup and progress live in the database:** `_logdb_writers` holds each writer's last batch number, `_logdb_meta` the next command position. Both change in the same transaction as the commands, so they travel with the pages.
+- **Effects:** each page is stored in full or as XOR against its previous version, whichever leaves fewer non-zero bytes; the whole record is MessagePack compressed with zstd. Commands are compressed the same way. An effect stops taking command records at ~512 KB encoded. An effect over 1 MB crashes the producer (no spill to object storage yet).
+
+```bash
+./target/release/logdb sql-bench                                    # in-memory logs
+./target/release/logdb sql-bench --log s2 --basin logdb-bench-976641 --clients 2000 --writers 3 --producers 2 --readers 2
+./target/release/logdb sql-serve --log s2 --basin logdb-bench-976641 --stream demo --producer --listen 127.0.0.1:7000
+./target/release/logdb sql-serve --log s2 --basin logdb-bench-976641 --stream demo --listen 127.0.0.1:7001
+curl -XPOST localhost:7001/txn -H 'content-type: application/json' \
+  -d '{"stmts":[{"sql":"CREATE TABLE kv(k TEXT PRIMARY KEY, v INTEGER)"}]}'
+curl -XPOST localhost:7001/txn -H 'content-type: application/json' \
+  -d '{"stmts":[{"sql":"INSERT INTO kv VALUES (?1, ?2) RETURNING *","params":["a",1]}]}'
+curl -XPOST localhost:7000/query -H 'content-type: application/json' -d '{"sql":"SELECT * FROM kv","min_cmd":2}'
+```
+
+`sql-bench` runs bank transfers (two `UPDATE`s, `CHECK (bal >= 0)`), then checks that every node holds byte-identical pages, `PRAGMA integrity_check` passes and money is conserved.
+
+| Setup (2,000 clients, 10k accounts) | txn/s | commit p50 | result p50 | result p99 | effects/s | KB/effect (raw) |
+|---|---|---|---|---|---|---|
+| mem 30 ms, 1 writer, 1 producer | 20,430 | 39 ms | 86 ms | 125 ms | 25.3 | 4.9 (112) |
+| mem, 3 writers, 3 producers, 2 readers, 10% lost acks | 17,558 | 35 ms | 113 ms | 191 ms | 22.7 | 4.0–4.8 (106–112) |
+| mem, 100k accounts | 20,809 | 36 ms | 87 ms | 130 ms | 23.8 | 8.7 (1,027) |
+| S2, 1 writer, 1 producer, 1 reader | 7,478 | 133 ms | 280 ms | 693 ms | 13.7 | 3.5 (115) |
+| S2, clients on the producer | 8,065 | 75 ms | 199 ms | 957 ms | 9.8 | 4.8 (111) |
+| S2, 3 writers, 2 producers, 2 readers | 8,018 | 95 ms | 238 ms | 382 ms | 11.9 | 4.2 (114) |
+
+All runs pass. S2 appends took 60–90 ms during these runs (laptop), about twice the day before.
+
+- Changed pages compress 25–100×: a transfer touches few bytes per page, so nearly every page goes out as XOR.
+- With racing producers, losers verified 35–48 effects per run against the winner's digest (43 in the in-memory run with 3 producers); none diverged. The producer that fetches ahead tends to win every race, and the other becomes a verifier.
+- Result latency is about command append + effect append + reading each: two to three round trips plus waiting for the effect in flight.
+
 ## Not yet
 
 - Pipelined appends (S2 append sessions); currently one append in flight per node.
 - Checkpoints: nodes replay the whole log on start.
+- SQL mode: spilling effects over 1 MB to object storage; lazy page fetch in the VFS.
 - S3 Express backend.
 - Runs from EC2 in-region.
