@@ -21,6 +21,8 @@ pub struct SqlBenchConfig {
     pub clients: usize,
     pub accounts: usize,
     pub duration: Duration,
+    /// Run transfers as JavaScript instead of two UPDATEs.
+    pub js: bool,
     pub node: SqlConfig,
 }
 
@@ -32,8 +34,19 @@ fn txn(stmts: &[(&str, serde_json::Value)]) -> SqlTxn {
             .iter()
             .map(|(sql, params)| Stmt { sql: sql.to_string(), params: params.as_array().cloned().unwrap_or_default() })
             .collect(),
+        ..Default::default()
     }
 }
+
+/// The transfer as JavaScript, which checks the balance itself.
+const TRANSFER_JS: &str = r#"
+const [from, to, amount] = args;
+const [{ bal }] = db.query("SELECT bal FROM acct WHERE id = ?1", [from]);
+if (bal < amount) throw new Error("insufficient funds");
+db.exec("UPDATE acct SET bal = bal - ?1 WHERE id = ?2", [amount, from]);
+db.exec("UPDATE acct SET bal = bal + ?1 WHERE id = ?2", [amount, to]);
+return bal - amount;
+"#;
 
 pub async fn run(
     make_logs: impl AsyncFn() -> anyhow::Result<(Arc<dyn Log>, Arc<dyn Log>)>,
@@ -69,7 +82,7 @@ pub async fn run(
     let clients: Vec<_> = (0..cfg.clients)
         .map(|c| {
             let w = writers[c % writers.len()].clone();
-            let accounts = cfg.accounts;
+            let (accounts, js) = (cfg.accounts, cfg.js);
             tokio::spawn(async move {
                 let (mut commit, mut result) = (Vec::new(), Vec::new());
                 let (mut aborted, mut errors) = (0u64, 0u64);
@@ -78,10 +91,14 @@ pub async fn run(
                         let mut rng = rand::thread_rng();
                         (rng.gen_range(0..accounts), rng.gen_range(0..accounts), rng.gen_range(1..=100))
                     };
-                    let t = txn(&[
-                        ("UPDATE acct SET bal = bal - ?1 WHERE id = ?2", json!([amount, from])),
-                        ("UPDATE acct SET bal = bal + ?1 WHERE id = ?2", json!([amount, to])),
-                    ]);
+                    let t = if js {
+                        SqlTxn { js: Some(TRANSFER_JS.into()), args: json!([from, to, amount]), ..Default::default() }
+                    } else {
+                        txn(&[
+                            ("UPDATE acct SET bal = bal - ?1 WHERE id = ?2", json!([amount, from])),
+                            ("UPDATE acct SET bal = bal + ?1 WHERE id = ?2", json!([amount, to])),
+                        ])
+                    };
                     let start = Instant::now();
                     let Ok((_, rx)) = w.submit(t).await else {
                         errors += 1;

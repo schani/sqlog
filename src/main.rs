@@ -96,6 +96,9 @@ enum Cmd {
         accounts: usize,
         #[arg(long, default_value_t = 20)]
         seconds: u64,
+        /// Run transfers as JavaScript transactions.
+        #[arg(long)]
+        js: bool,
     },
 }
 
@@ -262,7 +265,7 @@ async fn main() -> anyhow::Result<()> {
             println!("sql node {:016x} listening on {listen}", node.id);
             axum::serve(listener, sql::server::router(node)).await?;
         }
-        Cmd::SqlBench { log, epoch_ms, writers, producers, readers, clients, accounts, seconds } => {
+        Cmd::SqlBench { log, epoch_ms, writers, producers, readers, clients, accounts, seconds, js } => {
             let cfg = sql::bench::SqlBenchConfig {
                 writers,
                 producers,
@@ -270,6 +273,7 @@ async fn main() -> anyhow::Result<()> {
                 clients,
                 accounts,
                 duration: Duration::from_secs(seconds),
+                js,
                 node: sql::node::SqlConfig { epoch: Duration::from_millis(epoch_ms), ..Default::default() },
             };
             if !sql::bench::run(log.sql_factory(), cfg).await? {

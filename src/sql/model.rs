@@ -17,10 +17,17 @@ pub struct Stmt {
     pub params: Vec<Json>,
 }
 
-/// A transaction: statements executed atomically, in order. If one fails, none take effect.
-#[derive(Serialize, Deserialize, Clone, Debug)]
+/// A transaction: statements executed atomically, in order, or JavaScript code. If a
+/// statement fails or the code throws, nothing takes effect.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct SqlTxn {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub stmts: Vec<Stmt>,
+    /// Runs instead of `stmts`, as a function body with `args` and `db` in scope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub js: Option<String>,
+    #[serde(default, skip_serializing_if = "Json::is_null")]
+    pub args: Json,
 }
 
 /// One command record: a writer's batch of transactions.
@@ -35,8 +42,14 @@ pub struct CmdBatch {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "snake_case")]
 pub enum TxnOutcome {
-    /// `rows` are those of the last statement that returned rows.
-    Committed { changes: u64, rows: Vec<Vec<Json>> },
+    /// `rows` are those of the last statement that returned rows; `result` is what JavaScript
+    /// code returned.
+    Committed {
+        changes: u64,
+        rows: Vec<Vec<Json>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        result: Option<Json>,
+    },
     Aborted { error: String },
 }
 

@@ -1,4 +1,5 @@
 pub mod bench;
+pub mod js;
 pub mod model;
 pub mod node;
 pub mod server;

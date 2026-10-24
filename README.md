@@ -116,9 +116,10 @@ All 48 runs (S2 and in-memory): every node identical, money conserved. With 10% 
 Details:
 
 - **VFS** (`vfs.rs`): SQLite reads and writes pages through a custom VFS backed by the page store. The producer's connection writes into a pending overlay that becomes the next version when its effect lands. Query connections pin the latest version when SQLite takes its shared lock, so a read transaction sees one version while new ones are installed.
-- **Execution:** one SQLite transaction per command record; each client transaction runs in a savepoint, so a failing one (constraint violation, SQL error) aborts alone. `BEGIN`, `COMMIT`, `PRAGMA`, `ATTACH`, `VACUUM` and similar are rejected.
+- **Execution:** one SQLite transaction per command record; each client transaction runs in a savepoint, so a failing one (constraint violation, SQL error) aborts alone. A SQLite authorizer rejects transaction control, `ATTACH`, pragmas, `load_extension`, and writes to logdb's own `_logdb_*` tables, including writes from triggers.
+- **JavaScript transactions** (`js.rs`): instead of statements, a transaction can be JavaScript run on QuickJS as a function body with `args` and `db` in scope. `db.query(sql, params)` returns rows as objects, `db.exec(sql, params)` the number of rows changed; the return value, as JSON, is the transaction's result, and a throw aborts it. Each thread keeps one context, frozen after setup so transactions can't leave state behind; promise jobs run before the transaction ends. Memory, stack and operation limits abort runaway code.
 - **Dedup and progress live in the database:** `_logdb_writers` holds each writer's last batch number, `_logdb_meta` the next command position. Both change in the same transaction as the commands, so they travel with the pages.
-- **Effects:** each page is stored in full or as XOR against its previous version, whichever leaves fewer non-zero bytes; the whole record is MessagePack compressed with zstd. Commands are compressed the same way. An effect stops taking command records at ~512 KB encoded. An effect over 1 MB crashes the producer (no spill to object storage yet).
+- **Effects:** each page is stored in full or as XOR against its previous version, whichever leaves fewer non-zero bytes; the whole record is MessagePack compressed with zstd. Commands are compressed the same way. An effect stops taking command records at ~512 KB encoded. An effect over 1 MB (S2's record limit) is redone on half as many command records; a single record still over the limit is redone admitting its transactions one at a time, and those that don't fit abort. Effects don't spill to object storage yet.
 
 ```bash
 ./target/release/logdb sql-bench                                    # in-memory logs
@@ -129,10 +130,12 @@ curl -XPOST localhost:7001/txn -H 'content-type: application/json' \
   -d '{"stmts":[{"sql":"CREATE TABLE kv(k TEXT PRIMARY KEY, v INTEGER)"}]}'
 curl -XPOST localhost:7001/txn -H 'content-type: application/json' \
   -d '{"stmts":[{"sql":"INSERT INTO kv VALUES (?1, ?2) RETURNING *","params":["a",1]}]}'
+curl -XPOST localhost:7001/txn -H 'content-type: application/json' \
+  -d '{"js":"for (const k of args) db.exec(\"INSERT INTO kv VALUES (?1, 0) ON CONFLICT DO UPDATE SET v = v + 1\", [k]); return db.query(\"SELECT * FROM kv\");","args":["a","b"]}'
 curl -XPOST localhost:7000/query -H 'content-type: application/json' -d '{"sql":"SELECT * FROM kv","min_cmd":2}'
 ```
 
-`sql-bench` runs bank transfers (two `UPDATE`s, `CHECK (bal >= 0)`), then checks that every node holds byte-identical pages, `PRAGMA integrity_check` passes and money is conserved.
+`sql-bench` runs bank transfers (two `UPDATE`s, `CHECK (bal >= 0)`; with `--js`, a JavaScript transaction that checks the balance itself), then checks that every node holds byte-identical pages, `PRAGMA integrity_check` passes and money is conserved.
 
 | Setup (2,000 clients, 10k accounts) | txn/s | commit p50 | result p50 | result p99 | effects/s | KB/effect (raw) |
 |---|---|---|---|---|---|---|
@@ -142,8 +145,11 @@ curl -XPOST localhost:7000/query -H 'content-type: application/json' -d '{"sql":
 | S2, 1 writer, 1 producer, 1 reader | 7,478 | 133 ms | 280 ms | 693 ms | 13.7 | 3.5 (115) |
 | S2, clients on the producer | 8,065 | 75 ms | 199 ms | 957 ms | 9.8 | 4.8 (111) |
 | S2, 3 writers, 2 producers, 2 readers | 8,018 | 95 ms | 238 ms | 382 ms | 11.9 | 4.2 (114) |
+| mem, JS transfers | 17,957 | 35 ms | 109 ms | 158 ms | 18.6 | 8.0 (115) |
+| mem, JS, 3 writers, 2 producers, 2 readers, 10% lost acks | 15,814 | 35 ms | 115 ms | 195 ms | 17.1 | 6.8–6.9 (111–112) |
+| S2, JS transfers, clients on the producer | 9,673 | 74 ms | 196 ms | 634 ms | 10.0 | 7.4 (115) |
 
-All runs pass. S2 appends took 60–90 ms during these runs (laptop), about twice the day before.
+All runs pass. S2 appends took 60–90 ms during these runs (laptop), about twice the day before. A JavaScript transfer costs ~18 µs to execute, against ~6 µs for the two `UPDATE`s.
 
 - Changed pages compress 25–100×: a transfer touches few bytes per page, so nearly every page goes out as XOR.
 - With racing producers, losers verified 35–48 effects per run against the winner's digest (43 in the in-memory run with 3 producers); none diverged. The producer that fetches ahead tends to win every race, and the other becomes a verifier.
