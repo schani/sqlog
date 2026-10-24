@@ -21,7 +21,7 @@ pub struct BenchConfig {
     pub node: NodeConfig,
 }
 
-const INITIAL_BALANCE: i64 = 1000;
+pub(crate) const INITIAL_BALANCE: i64 = 1000;
 
 pub async fn run(make_log: impl AsyncFn() -> anyhow::Result<Arc<dyn Log>>, cfg: BenchConfig) -> anyhow::Result<bool> {
     let mut writers = Vec::new();
@@ -134,7 +134,7 @@ pub async fn run(make_log: impl AsyncFn() -> anyhow::Result<Arc<dyn Log>>, cfg: 
     Ok(ok)
 }
 
-fn account(i: usize) -> String {
+pub(crate) fn account(i: usize) -> String {
     format!("acct/{i:06}")
 }
 

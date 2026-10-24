@@ -77,6 +77,18 @@ pub struct Node {
 }
 
 impl Node {
+    /// Starts only if the shared log is empty, before any background replay can race inspection.
+    pub async fn start_empty(log: Arc<dyn Log>, config: NodeConfig) -> anyhow::Result<Arc<Self>> {
+        anyhow::ensure!(log.read(0, Duration::ZERO).await?.is_empty(), "benchmark requires a fresh empty stream");
+        Ok(Self::start(log, config))
+    }
+
+    pub async fn ensure_empty_log(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(self.log.read(0, Duration::ZERO).await?.is_empty(), "stream is no longer empty");
+        anyhow::ensure!(self.next_seq() == 0, "node is not empty");
+        Ok(())
+    }
+
     pub fn start(log: Arc<dyn Log>, config: NodeConfig) -> Arc<Self> {
         let (submit, rx) = mpsc::unbounded_channel();
         let node = Arc::new(Self {

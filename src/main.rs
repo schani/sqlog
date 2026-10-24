@@ -1,4 +1,5 @@
 mod bench;
+mod bench_distributed;
 mod log;
 mod node;
 mod s2;
@@ -33,16 +34,31 @@ enum Cmd {
         #[arg(long, default_value = "127.0.0.1:7000")]
         listen: String,
     },
-    /// In-process benchmark: bank transfers through writer nodes, verified on replicas.
+    /// Host one native benchmark writer. Control API: trusted local/tailnet networks only.
+    BenchWorker {
+        #[command(flatten)]
+        log: LogArgs,
+        #[command(flatten)]
+        node: NodeArgs,
+        #[arg(long, default_value = "127.0.0.1:7100")]
+        listen: String,
+    },
+    /// Bank-transfer benchmark: in-process, or coordinated across native --worker nodes.
     Bench {
         #[command(flatten)]
         log: LogArgs,
         #[command(flatten)]
         node: NodeArgs,
-        #[arg(long, default_value_t = 1)]
+        #[arg(long, default_value_t = 1, conflicts_with = "worker")]
         writers: usize,
-        #[arg(long, default_value_t = 1)]
+        #[arg(long, default_value_t = 1, conflicts_with = "worker")]
         replicas: usize,
+        /// Remote native worker origin; repeat per writer. --clients is the total.
+        #[arg(long)]
+        worker: Vec<String>,
+        /// Write a distributed benchmark JSON report.
+        #[arg(long, requires = "worker")]
+        output: Option<std::path::PathBuf>,
         #[arg(long, default_value_t = 1000)]
         clients: usize,
         #[arg(long, default_value_t = 10_000)]
@@ -191,7 +207,41 @@ async fn main() -> anyhow::Result<()> {
             println!("node {:016x} listening on {listen}", node.id);
             axum::serve(listener, server::router(node)).await?;
         }
-        Cmd::Bench { log, node, writers, replicas, clients, accounts, seconds } => {
+        Cmd::BenchWorker { log, node, listen } => {
+            anyhow::ensure!(matches!(log.log, LogKind::S2), "bench-worker requires --log s2");
+            let stream = log.stream.as_ref().context("bench-worker requires explicit --stream")?;
+            anyhow::ensure!(!stream.is_empty(), "stream must not be empty");
+            let basin = log.basin.as_ref().context("--basin or S2_BASIN required")?;
+            let identity = bench_distributed::Identity::new(basin.clone(), stream.clone(), &node.config());
+            let worker = bench_distributed::Worker::new(log.factory()().await?, node.config(), identity).await?;
+            let listener = tokio::net::TcpListener::bind(&listen).await?;
+            println!("benchmark worker listening on {listen}; unauthenticated control: trusted networks only");
+            axum::serve(listener, bench_distributed::router(worker)).await?;
+        }
+        Cmd::Bench { log, node, writers, replicas, worker, output, clients, accounts, seconds } => {
+            anyhow::ensure!(clients > 0 && accounts > 0 && seconds > 0, "clients, accounts and seconds must be positive");
+            if !worker.is_empty() {
+                let result = bench_distributed::run(bench_distributed::Config {
+                    workers: worker, clients, accounts, duration: Duration::from_secs(seconds),
+                }).await;
+                if let Some(path) = output {
+                    let json = match &result {
+                        Ok(report) => serde_json::to_vec_pretty(report)?,
+                        Err(error) => serde_json::to_vec_pretty(&serde_json::json!({
+                            "pass": false, "error": format!("{error:#}")
+                        }))?,
+                    };
+                    std::fs::write(path, json)?;
+                }
+                let report = match result {
+                    Ok(report) => report,
+                    Err(error) => { println!("FAIL: {error:#}"); return Err(error); }
+                };
+                bench_distributed::print_report(&report);
+                if !report.pass { std::process::exit(1); }
+                return Ok(());
+            }
+            anyhow::ensure!(writers > 0, "writers must be positive");
             let cfg = bench::BenchConfig {
                 writers,
                 replicas,
@@ -228,4 +278,18 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    #[test]
+    fn remote_options_conflict_only_when_explicit() {
+        assert!(Cli::try_parse_from(["logdb", "bench", "--worker", "http://host:7100"]).is_ok());
+        for option in ["--writers", "--replicas"] {
+            assert!(Cli::try_parse_from(["logdb", "bench", "--worker", "http://host:7100", option, "1"]).is_err());
+        }
+        assert!(Cli::try_parse_from(["logdb", "bench", "--output", "report.json"]).is_err());
+    }
 }

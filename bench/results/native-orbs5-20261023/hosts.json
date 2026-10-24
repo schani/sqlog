@@ -1,0 +1,56 @@
+{
+  "base_commit": "db3fde44a99ffa66198f80fab48a6e0ee99a4e30",
+  "native_benchmark_source_sha256": "2a0d90be24b29706258da3f0789f2c2e631a998b3dddef204d709c8b5ee9f372",
+  "rust": "1.99.1",
+  "zone": "us-central1-a",
+  "vcpus_per_writer": 2,
+  "s2_location": "aws:us-west-2",
+  "transport": "Tailscale Serve TCP and coordinator-local socat/tailscale nc relays; HTTP control only, native Node::submit workload on each writer VM",
+  "writers": [
+    {
+      "writer": 1,
+      "orb_id": "11e37130-9167-42e1-81c3-79414ba0be34",
+      "orb_url": "https://pi-orb-issuer-1077475695242.us-central1.run.app/orbs/11e37130-9167-42e1-81c3-79414ba0be34",
+      "gce_instance_id": "7440346410244265681",
+      "tailnet_ip": "100.115.69.90",
+      "conditional_node_id": "bd924853ea97c1fe",
+      "unconditional_node_id": "4852edf722791b53"
+    },
+    {
+      "writer": 2,
+      "orb_id": "545650ac-09ff-4c63-892c-5ec00493c522",
+      "orb_url": "https://pi-orb-issuer-1077475695242.us-central1.run.app/orbs/545650ac-09ff-4c63-892c-5ec00493c522",
+      "gce_instance_id": "4198702547754964688",
+      "tailnet_ip": "100.82.161.35",
+      "conditional_node_id": "73f426e198c28d3b",
+      "unconditional_node_id": "e7b5c5b1f3366d61"
+    },
+    {
+      "writer": 3,
+      "orb_id": "e1aab752-dc04-4c65-878c-f06d39257bbc",
+      "orb_url": "https://pi-orb-issuer-1077475695242.us-central1.run.app/orbs/e1aab752-dc04-4c65-878c-f06d39257bbc",
+      "gce_instance_id": "3370720195541096145",
+      "tailnet_ip": "100.119.248.123",
+      "conditional_node_id": "3f73ba6623157a4c",
+      "unconditional_node_id": "d6920d46ecffcb43"
+    },
+    {
+      "writer": 4,
+      "orb_id": "9403772d-086c-47d0-87d2-ae495e049c22",
+      "orb_url": "https://pi-orb-issuer-1077475695242.us-central1.run.app/orbs/9403772d-086c-47d0-87d2-ae495e049c22",
+      "gce_instance_id": "8031184312167978705",
+      "tailnet_ip": "100.117.139.15",
+      "conditional_node_id": "13d417274cdbf1ca",
+      "unconditional_node_id": "4d99c8483ea625af"
+    },
+    {
+      "writer": 5,
+      "orb_id": "4d96c15d-f105-40fc-8747-4a33214db343",
+      "orb_url": "https://pi-orb-issuer-1077475695242.us-central1.run.app/orbs/4d96c15d-f105-40fc-8747-4a33214db343",
+      "gce_instance_id": "4171139474873800401",
+      "tailnet_ip": "100.82.98.117",
+      "conditional_node_id": "a7f3cde69f7c833d",
+      "unconditional_node_id": "4432fd4dcf80b735"
+    }
+  ]
+}

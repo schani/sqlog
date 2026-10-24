@@ -1,0 +1,9 @@
+writer 4852edf722791b53: clients 400 timed 116241 drain 400 aborted 789/6 errors 0 epochs 315 conflicts 0 append_errors 0 append_ms 21757.3 seq 1464 hash f7048881a57aa1ff txns_applied 547038 total 10000000
+writer e7b5c5b1f3366d61: clients 400 timed 100063 drain 400 aborted 657/10 errors 0 epochs 269 conflicts 0 append_errors 0 append_ms 18726.1 seq 1464 hash f7048881a57aa1ff txns_applied 547038 total 10000000
+writer d6920d46ecffcb43: clients 400 timed 101632 drain 400 aborted 715/11 errors 0 epochs 284 conflicts 0 append_errors 0 append_ms 20218.5 seq 1464 hash f7048881a57aa1ff txns_applied 547038 total 10000000
+writer 4d99c8483ea625af: clients 400 timed 99540 drain 400 aborted 681/9 errors 0 epochs 277 conflicts 0 append_errors 0 append_ms 19317.3 seq 1464 hash f7048881a57aa1ff txns_applied 547038 total 10000000
+writer 4432fd4dcf80b735: clients 400 timed 117562 drain 400 aborted 852/8 errors 0 epochs 317 conflicts 0 append_errors 0 append_ms 22077.6 seq 1464 hash f7048881a57aa1ff txns_applied 547038 total 10000000
+535038 timed acknowledgements in 30.000s: 17834.6 txn/s; 2000 drained, 3694 aborted (+44 drain), 0 errors
+pooled txn latency ms (2% histogram): p50 116.28 p90 141.74 p99 246.78 max 490.95
+epochs 1462 conflicts 0 append_errors 0 mean append attempt 69.83 ms
+PASS: all writers identical, accounts valid, money and transactions conserved

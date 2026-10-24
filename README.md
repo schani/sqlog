@@ -38,6 +38,25 @@ curl localhost:7000/get/bal%2F1
 curl localhost:7000/status
 ```
 
+### Native distributed benchmark
+
+Each worker generates bank transfers through native `Node::submit`; HTTP carries only control and reports, not transactions. The control API is unauthenticated: bind it only on a trusted local/tailnet network. Synchronize clocks on all hosts, including the coordinator.
+
+Start all workers on the same **fresh S2 stream**, with matching append/epoch settings. Export `S2_API_KEY` and `S2_BASIN` on each writer host first. For example, on two writer hosts (replace the tailnet IPs and `bench-UNIQUE`):
+
+```bash
+# Writer A
+./target/release/logdb bench-worker --log s2 --basin "$S2_BASIN" --stream bench-UNIQUE --append unconditional --listen 100.64.0.11:7100
+# Writer B
+./target/release/logdb bench-worker --log s2 --basin "$S2_BASIN" --stream bench-UNIQUE --append unconditional --listen 100.64.0.12:7100
+
+# Coordinator: 2,000 clients total, split across the workers
+./target/release/logdb bench --worker http://100.64.0.11:7100 --worker http://100.64.0.12:7100 \
+  --clients 2000 --accounts 10000 --seconds 20 --output distributed.json
+```
+
+The coordinator seeds once, schedules a common measurement window, drains outstanding requests, and verifies identical state, balances, and transaction counts. Reports separate timed throughput from drained acknowledgements and pool worker latency histograms. `--output` saves JSON; failures exit nonzero. Workers are one-shot: restart every worker with a new fresh stream for each run. [Five-VM S2 results](bench/results/writers-orbs.md).
+
 ## First numbers (laptop → S2 Express us-west-2, ~30 ms RTT)
 
 | Setup | Throughput | p50 | p99 |
