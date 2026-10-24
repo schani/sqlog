@@ -1,4 +1,4 @@
-# log-db
+# SQLog
 
 A prototype database whose only durable state is a shared log (currently [S2](https://s2.dev)). No WAL tier, no consensus cluster, no replication protocol.
 
@@ -22,15 +22,15 @@ cargo build --release
 In-process benchmark (bank transfers; verifies all nodes end identical and money is conserved):
 
 ```bash
-./target/release/logdb bench                                  # in-memory log, 30 ms simulated RTT
-./target/release/logdb bench --log s2 --basin logdb-bench-976641 --clients 2000
-./target/release/logdb bench --log s2 --basin logdb-bench-976641 --writers 2 --replicas 2
+./target/release/sqlog bench                                  # in-memory log, 30 ms simulated RTT
+./target/release/sqlog bench --log s2 --basin logdb-bench-976641 --clients 2000
+./target/release/sqlog bench --log s2 --basin logdb-bench-976641 --writers 2 --replicas 2
 ```
 
 HTTP node (run several on the same `--stream`):
 
 ```bash
-./target/release/logdb serve --log s2 --basin logdb-bench-976641 --stream demo --listen 127.0.0.1:7000
+./target/release/sqlog serve --log s2 --basin logdb-bench-976641 --stream demo --listen 127.0.0.1:7000
 curl -XPOST localhost:7000/txn -H 'content-type: application/json' -d '{"op":"put","key":"bal/1","value":100}'
 curl -XPOST localhost:7000/txn -H 'content-type: application/json' -d '{"op":"transfer","from":"bal/1","to":"bal/2","amount":30}'
 curl 'localhost:7000/scan?prefix=bal/&min_seq=2'
@@ -46,12 +46,12 @@ Start all workers on the same **fresh S2 stream**, with matching append/epoch se
 
 ```bash
 # Writer A
-./target/release/logdb bench-worker --log s2 --basin "$S2_BASIN" --stream bench-UNIQUE --append unconditional --listen 100.64.0.11:7100
+./target/release/sqlog bench-worker --log s2 --basin "$S2_BASIN" --stream bench-UNIQUE --append unconditional --listen 100.64.0.11:7100
 # Writer B
-./target/release/logdb bench-worker --log s2 --basin "$S2_BASIN" --stream bench-UNIQUE --append unconditional --listen 100.64.0.12:7100
+./target/release/sqlog bench-worker --log s2 --basin "$S2_BASIN" --stream bench-UNIQUE --append unconditional --listen 100.64.0.12:7100
 
 # Coordinator: 2,000 clients total, split across the workers
-./target/release/logdb bench --worker http://100.64.0.11:7100 --worker http://100.64.0.12:7100 \
+./target/release/sqlog bench --worker http://100.64.0.11:7100 --worker http://100.64.0.12:7100 \
   --clients 2000 --accounts 10000 --seconds 20 --output distributed.json
 ```
 
@@ -116,16 +116,16 @@ All 48 runs (S2 and in-memory): every node identical, money conserved. With 10% 
 Details:
 
 - **VFS** (`vfs.rs`): SQLite reads and writes pages through a custom VFS backed by the page store. The producer's connection writes into a pending overlay that becomes the next version when its effect lands. Query connections pin the latest version when SQLite takes its shared lock, so a read transaction sees one version while new ones are installed.
-- **Execution:** one SQLite transaction per command record; each client transaction runs in a savepoint, so a failing one (constraint violation, SQL error) aborts alone. A SQLite authorizer rejects transaction control, `ATTACH`, pragmas, `load_extension`, and writes to logdb's own `_logdb_*` tables, including writes from triggers.
+- **Execution:** one SQLite transaction per command record; each client transaction runs in a savepoint, so a failing one (constraint violation, SQL error) aborts alone. A SQLite authorizer rejects transaction control, `ATTACH`, pragmas, `load_extension`, and writes to SQLog's own `_sqlog_*` tables, including writes from triggers.
 - **JavaScript transactions** (`js.rs`): instead of statements, a transaction can be JavaScript run on QuickJS as a function body with `args` and `db` in scope. `db.query(sql, params)` returns rows as objects, `db.exec(sql, params)` the number of rows changed; the return value, as JSON, is the transaction's result, and a throw aborts it. Each thread keeps one context, frozen after setup so transactions can't leave state behind; promise jobs run before the transaction ends. Memory, stack and operation limits abort runaway code.
-- **Dedup and progress live in the database:** `_logdb_writers` holds each writer's last batch number, `_logdb_meta` the next command position. Both change in the same transaction as the commands, so they travel with the pages.
+- **Dedup and progress live in the database:** `_sqlog_writers` holds each writer's last batch number, `_sqlog_meta` the next command position. Both change in the same transaction as the commands, so they travel with the pages.
 - **Effects:** each page is stored in full or as XOR against its previous version, whichever leaves fewer non-zero bytes; the whole record is MessagePack compressed with zstd. Commands are compressed the same way. An effect stops taking command records at ~512 KB encoded. An effect over 1 MB (S2's record limit) is redone on half as many command records; a single record still over the limit is redone admitting its transactions one at a time, and those that don't fit abort. Effects don't spill to object storage yet.
 
 ```bash
-./target/release/logdb sql-bench                                    # in-memory logs
-./target/release/logdb sql-bench --log s2 --basin logdb-bench-976641 --clients 2000 --writers 3 --producers 2 --readers 2
-./target/release/logdb sql-serve --log s2 --basin logdb-bench-976641 --stream demo --producer --listen 127.0.0.1:7000
-./target/release/logdb sql-serve --log s2 --basin logdb-bench-976641 --stream demo --listen 127.0.0.1:7001
+./target/release/sqlog sql-bench                                    # in-memory logs
+./target/release/sqlog sql-bench --log s2 --basin logdb-bench-976641 --clients 2000 --writers 3 --producers 2 --readers 2
+./target/release/sqlog sql-serve --log s2 --basin logdb-bench-976641 --stream demo --producer --listen 127.0.0.1:7000
+./target/release/sqlog sql-serve --log s2 --basin logdb-bench-976641 --stream demo --listen 127.0.0.1:7001
 curl -XPOST localhost:7001/txn -H 'content-type: application/json' \
   -d '{"stmts":[{"sql":"CREATE TABLE kv(k TEXT PRIMARY KEY, v INTEGER)"}]}'
 curl -XPOST localhost:7001/txn -H 'content-type: application/json' \

@@ -554,8 +554,8 @@ fn open_exec(name: &str) -> anyhow::Result<Connection> {
 fn execute_record(conn: &Connection, r: &Record, fits: Option<&dyn Fn(&BatchOutcome, u32) -> bool>) -> anyhow::Result<Option<BatchOutcome>> {
     conn.execute_batch(
         "BEGIN IMMEDIATE;
-         CREATE TABLE IF NOT EXISTS _logdb_meta(id INTEGER PRIMARY KEY CHECK (id = 0), cmd_next INTEGER NOT NULL);
-         CREATE TABLE IF NOT EXISTS _logdb_writers(writer INTEGER PRIMARY KEY, batch_no INTEGER NOT NULL);",
+         CREATE TABLE IF NOT EXISTS _sqlog_meta(id INTEGER PRIMARY KEY CHECK (id = 0), cmd_next INTEGER NOT NULL);
+         CREATE TABLE IF NOT EXISTS _sqlog_writers(writer INTEGER PRIMARY KEY, batch_no INTEGER NOT NULL);",
     )?;
     let result = (|| -> anyhow::Result<Option<BatchOutcome>> {
         let Ok(batch) = model::decode::<CmdBatch>(&r.body) else {
@@ -564,12 +564,12 @@ fn execute_record(conn: &Connection, r: &Record, fits: Option<&dyn Fn(&BatchOutc
         };
         let writer = batch.writer as i64;
         let last: Option<i64> = conn
-            .query_row("SELECT batch_no FROM _logdb_writers WHERE writer = ?1", [writer], |row| row.get(0))
+            .query_row("SELECT batch_no FROM _sqlog_writers WHERE writer = ?1", [writer], |row| row.get(0))
             .optional()?;
         if last.is_some_and(|l| l as u64 >= batch.batch_no) {
             return Ok(None);
         }
-        conn.execute("INSERT OR REPLACE INTO _logdb_writers VALUES (?1, ?2)", (writer, batch.batch_no as i64))?;
+        conn.execute("INSERT OR REPLACE INTO _sqlog_writers VALUES (?1, ?2)", (writer, batch.batch_no as i64))?;
         let mut out = BatchOutcome { writer: batch.writer, batch_no: batch.batch_no, cmd_seq: r.seq, txns: Vec::new() };
         for t in &batch.txns {
             let o = run_txn(conn, t, &mut |o| {
@@ -587,7 +587,7 @@ fn execute_record(conn: &Connection, r: &Record, fits: Option<&dyn Fn(&BatchOutc
     })();
     match result {
         Ok(o) => {
-            conn.execute("INSERT OR REPLACE INTO _logdb_meta VALUES (0, ?1)", [(r.seq + 1) as i64])?;
+            conn.execute("INSERT OR REPLACE INTO _sqlog_meta VALUES (0, ?1)", [(r.seq + 1) as i64])?;
             conn.execute_batch("COMMIT")?;
             Ok(o)
         }
@@ -644,14 +644,14 @@ fn run_txn(conn: &Connection, txn: &SqlTxn, fits: &mut dyn FnMut(&TxnOutcome) ->
 }
 
 /// Client SQL may not frame transactions, attach files, run pragmas, load extensions, or
-/// change logdb's own tables, which hold dedup state and progress. Applies while `CLIENT_SQL`
-/// is set; logdb's own statements run unchecked.
+/// change SQLog's own tables, which hold dedup state and progress. Applies while `CLIENT_SQL`
+/// is set; SQLog's own statements run unchecked.
 fn authorize(ctx: AuthContext<'_>) -> Authorization {
     use AuthAction::*;
     if !CLIENT_SQL.get() {
         return Authorization::Allow;
     }
-    let internal = |t: &str| t.get(..7).is_some_and(|p| p.eq_ignore_ascii_case("_logdb_"));
+    let internal = |t: &str| t.get(..7).is_some_and(|p| p.eq_ignore_ascii_case("_sqlog_"));
     match ctx.action {
         Transaction { .. } | Savepoint { .. } | Attach { .. } | Detach { .. } | Pragma { .. } => Authorization::Deny,
         Function { function_name } if function_name.eq_ignore_ascii_case("load_extension") => Authorization::Deny,
@@ -743,13 +743,13 @@ mod tests {
         let reader = SqlNode::start(cmd, fx, SqlConfig::default());
         assert!(!aborted(&run(&node, "CREATE TABLE kv(k TEXT PRIMARY KEY, v INTEGER)").await));
         for sql in [
-            "UPDATE _logdb_meta SET cmd_next = 0",
-            "DELETE FROM _logdb_writers",
-            "INSERT INTO _LOGDB_writers VALUES (1, 1)",
-            "DROP TABLE _logdb_meta",
-            "CREATE INDEX i ON _logdb_writers(batch_no)",
-            "CREATE TEMP TRIGGER t AFTER INSERT ON _logdb_writers BEGIN SELECT 1; END",
-            "CREATE TABLE _logdb_mine(x)",
+            "UPDATE _sqlog_meta SET cmd_next = 0",
+            "DELETE FROM _sqlog_writers",
+            "INSERT INTO _SQLOG_writers VALUES (1, 1)",
+            "DROP TABLE _sqlog_meta",
+            "CREATE INDEX i ON _sqlog_writers(batch_no)",
+            "CREATE TEMP TRIGGER t AFTER INSERT ON _sqlog_writers BEGIN SELECT 1; END",
+            "CREATE TABLE _sqlog_mine(x)",
             "BEGIN",
             "COMMIT",
             "SAVEPOINT s",
@@ -760,11 +760,11 @@ mod tests {
             assert!(aborted(&run(&node, sql).await), "{sql} was allowed");
         }
         // A trigger may exist, but not write internal tables when it fires.
-        assert!(!aborted(&run(&node, "CREATE TRIGGER t AFTER INSERT ON kv BEGIN UPDATE _logdb_meta SET cmd_next = 0; END").await));
+        assert!(!aborted(&run(&node, "CREATE TRIGGER t AFTER INSERT ON kv BEGIN UPDATE _sqlog_meta SET cmd_next = 0; END").await));
         assert!(aborted(&run(&node, "INSERT INTO kv VALUES ('a', 1)").await));
         assert!(!aborted(&run(&node, "DROP TRIGGER t").await));
         assert!(!aborted(&run(&node, "INSERT INTO kv VALUES ('a', 1)").await));
-        assert!(matches!(run(&node, "SELECT count(*) FROM _logdb_writers").await, TxnOutcome::Committed { rows, .. } if rows == vec![vec![Json::from(1)]]));
+        assert!(matches!(run(&node, "SELECT count(*) FROM _sqlog_writers").await, TxnOutcome::Committed { rows, .. } if rows == vec![vec![Json::from(1)]]));
         assert_same(&node, &reader).await;
     }
 
@@ -796,7 +796,7 @@ mod tests {
         let o = node.execute(js("try { db.query('SELECT nope FROM kv'); } catch (e) { return 'caught'; }", Json::Null)).await.unwrap().outcome;
         assert!(matches!(&o, TxnOutcome::Committed { result: Some(r), .. } if r == "caught"), "{o:?}");
         // The authorizer applies to SQL from JavaScript.
-        let o = node.execute(js("db.exec('DELETE FROM _logdb_writers')", Json::Null)).await.unwrap().outcome;
+        let o = node.execute(js("db.exec('DELETE FROM _sqlog_writers')", Json::Null)).await.unwrap().outcome;
         assert!(aborted(&o), "{o:?}");
         // Runaway code aborts instead of stalling the producer.
         let o = node.execute(js("while (true) {}", Json::Null)).await.unwrap().outcome;

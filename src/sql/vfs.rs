@@ -15,7 +15,7 @@ use rusqlite::ffi;
 use xxhash_rust::xxh3::Xxh3;
 
 pub const PAGE_SIZE: usize = 4096;
-pub const VFS_NAME: &str = "logdb";
+pub const VFS_NAME: &str = "sqlog";
 
 pub type Page = Arc<[u8]>;
 
@@ -219,9 +219,9 @@ impl PageStore {
 
 static STORES: LazyLock<Mutex<HashMap<String, Arc<PageStore>>>> = LazyLock::new(Default::default);
 static REGISTER: Once = Once::new();
-const PREFIX: &str = "logdb:";
+const PREFIX: &str = "sqlog:";
 
-/// Makes `store` openable as `path(name, exec)` through the `logdb` VFS.
+/// Makes `store` openable as `path(name, exec)` through the `sqlog` VFS.
 pub fn register_store(name: &str, store: Arc<PageStore>) {
     register_vfs();
     STORES.lock().unwrap().insert(name.to_string(), store);

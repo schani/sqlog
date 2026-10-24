@@ -146,7 +146,7 @@ impl LogArgs {
     fn stream_name(&self) -> String {
         self.stream.clone().unwrap_or_else(|| {
             let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
-            format!("logdb-{ts}")
+            format!("sqlog-{ts}")
         })
     }
 
@@ -290,10 +290,10 @@ mod cli_tests {
 
     #[test]
     fn remote_options_conflict_only_when_explicit() {
-        assert!(Cli::try_parse_from(["logdb", "bench", "--worker", "http://host:7100"]).is_ok());
+        assert!(Cli::try_parse_from(["sqlog", "bench", "--worker", "http://host:7100"]).is_ok());
         for option in ["--writers", "--replicas"] {
-            assert!(Cli::try_parse_from(["logdb", "bench", "--worker", "http://host:7100", option, "1"]).is_err());
+            assert!(Cli::try_parse_from(["sqlog", "bench", "--worker", "http://host:7100", option, "1"]).is_err());
         }
-        assert!(Cli::try_parse_from(["logdb", "bench", "--output", "report.json"]).is_err());
+        assert!(Cli::try_parse_from(["sqlog", "bench", "--output", "report.json"]).is_err());
     }
 }

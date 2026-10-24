@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Sweep writer count and epoch wait; prints one markdown row per run.
-# Usage: writers.sh <seconds> <clients> [logdb bench args...]
+# Usage: writers.sh <seconds> <clients> [sqlog bench args...]
 set -euo pipefail
 secs=$1 clients=$2; shift 2
-bin="$(dirname "$0")/../../target/release/logdb"
+bin="$(dirname "$0")/../../target/release/sqlog"
 echo "| writers | epoch ms | txn/s | p50 ms | p99 ms | max ms | epochs/s | txns/epoch | conflicts/epoch | check |"
 echo "|---|---|---|---|---|---|---|---|---|---|"
 for w in 1 2 4 6 8 10; do
