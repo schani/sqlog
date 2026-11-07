@@ -4,6 +4,7 @@ mod log;
 mod node;
 mod s2;
 mod server;
+mod sim;
 mod sql;
 mod state;
 
@@ -100,6 +101,8 @@ enum Cmd {
         #[arg(long)]
         js: bool,
     },
+    /// Deterministic simulation: seeded faults, then a serializability check of what clients saw.
+    Sim(sim::SimArgs),
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -277,6 +280,12 @@ async fn main() -> anyhow::Result<()> {
                 node: sql::node::SqlConfig { epoch: Duration::from_millis(epoch_ms), ..Default::default() },
             };
             if !sql::bench::run(log.sql_factory(), cfg).await? {
+                std::process::exit(1);
+            }
+        }
+        Cmd::Sim(args) => {
+            // Simulation runs on its own runtime, which can't start from inside this one.
+            if !std::thread::spawn(move || sim::main(args)).join().expect("simulation thread")? {
                 std::process::exit(1);
             }
         }

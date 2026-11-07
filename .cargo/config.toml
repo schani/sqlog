@@ -1,0 +1,3 @@
+# Lets simulation seed Tokio's internal random numbers (`Builder::rng_seed`).
+[build]
+rustflags = ["--cfg", "tokio_unstable"]

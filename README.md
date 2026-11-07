@@ -119,7 +119,7 @@ Details:
 - **Execution:** one SQLite transaction per command record; each client transaction runs in a savepoint, so a failing one (constraint violation, SQL error) aborts alone. A SQLite authorizer rejects transaction control, `ATTACH`, pragmas, `load_extension`, and writes to SQLog's own `_sqlog_*` tables, including writes from triggers.
 - **JavaScript transactions** (`js.rs`): instead of statements, a transaction can be JavaScript run on QuickJS as a function body with `args` and `db` in scope. `db.query(sql, params)` returns rows as objects, `db.exec(sql, params)` the number of rows changed; the return value, as JSON, is the transaction's result, and a throw aborts it. Each thread keeps one context, frozen after setup so transactions can't leave state behind; promise jobs run before the transaction ends. Memory, stack and operation limits abort runaway code.
 - **Dedup and progress live in the database:** `_sqlog_writers` holds each writer's last batch number, `_sqlog_meta` the next command position. Both change in the same transaction as the commands, so they travel with the pages.
-- **Effects:** each page is stored in full or as XOR against its previous version, whichever leaves fewer non-zero bytes; the whole record is MessagePack compressed with zstd. Commands are compressed the same way. An effect stops taking command records at ~512 KB encoded. An effect over 1 MB (S2's record limit) is redone on half as many command records; a single record still over the limit is redone admitting its transactions one at a time, and those that don't fit abort. Effects don't spill to object storage yet.
+- **Effects:** each page is stored in full or as XOR against its previous version, whichever leaves fewer non-zero bytes; the whole record is MessagePack compressed with zstd. Commands are compressed the same way. An effect stops taking command records at ~512 KB encoded. An effect over 1 MB (S2's record limit) is redone on half as many command records; a single record still over the limit is redone admitting its transactions one at a time, and those that don't fit abort. Each such abort restarts the record from a clean state without that transaction, because rolling back leaves its data in reused free pages, which SQLite doesn't journal. The same restart handles a statement that rolls back the whole SQLite transaction (`INSERT OR ROLLBACK`, `RAISE(ROLLBACK)`). Effects don't spill to object storage yet.
 
 ```bash
 ./target/release/sqlog sql-bench                                    # in-memory logs
@@ -154,6 +154,39 @@ All runs pass. S2 appends took 60–90 ms during these runs (laptop), about twic
 - Changed pages compress 25–100×: a transfer touches few bytes per page, so nearly every page goes out as XOR.
 - With racing producers, losers verified 35–48 effects per run against the winner's digest (43 in the in-memory run with 3 producers); none diverged. The producer that fetches ahead tends to win every race, and the other becomes a verifier.
 - Result latency is about command append + effect append + reading each: two to three round trips plus waiting for the effect in flight.
+
+## Simulation
+
+`src/sim/`. Runs real SQL nodes on a single-threaded runtime with virtual time and a fault-injecting log, so a run is a function of its seed.
+
+```bash
+./target/release/sqlog sim --seeds 1000 --secs 30   # sweep; failures print their seed
+./target/release/sqlog sim --seeds 300 --twice      # also require identical traces
+./target/release/sqlog sim --seed 1350 --secs 30 --history h.json   # replay one
+```
+
+- **Faults:** dropped appends, lost acks, appends that report failure and land up to 5 s later, read errors, short and empty reads, latency spikes, 1 MB record limit, node crashes (including all at once), node partitions and log outages. Rates and cluster shape come from the seed.
+- **Workload:** list-append transactions in JavaScript and SQL, planned aborts, DDL, transactions that go over the effect limit, SQL that attacks the transaction frame, and queries at three consistency levels.
+- **Checks:** an Elle-style black-box checker (`checker.rs`) infers dependencies from what clients read and looks for G0, G1a, G1b, G1c, G-single, G2 and real-time cycles, lost writes, and partial effects of transactions with unknown outcomes. Read-write transactions must be strictly serializable. After faults stop, nodes must converge to identical bytes, no operation may be stuck, and an audit of both logs must show every batch ran at most once.
+
+Latest sweep: 3,000 seeds of 30 virtual seconds in 342 s, with 1.13M commits, 128k aborts, 49k unknown outcomes, 443k queries, 30.6k crashes, 10.8k partitions and 4.5k outages; all pass. 300 seeds run twice gave identical traces.
+
+Planted bugs, 60 seeds each:
+
+| Bug | Seeds failing | Detected as |
+|---|---|---|
+| No batch dedup | 55 | duplicate elements, cycles |
+| Unconditional effect append | 60 | panic on a forked log |
+| Query ignores `min_cmd` | 53 | real-time cycles |
+| Abort keeps its writes | 60 | G1a |
+| Outcomes sent before the effect lands | 60 | panics, lost writes, audit |
+| Snapshots read pending pages | 7 | real-time cycles |
+| Rollback garbage kept in effects | 1 | producers stuck (run hangs) |
+| Frame loss ignored | 57 | no convergence, lost writes |
+
+Not reloading the executor after others' effects goes unnoticed, correctly: SQLite resets its cache when page 1's change counter differs, so the reopen in `produce` is only defensive.
+
+Limits: tasks never run in parallel, so thread races between queries and the applier are out of reach; SQL takes no virtual time; and the log is assumed linearizable and durable, so this says nothing about S2 itself. Clients don't retry unknown outcomes, since there are no idempotency keys.
 
 ## Not yet
 

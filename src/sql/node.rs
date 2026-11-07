@@ -12,7 +12,7 @@
 //! isn't canonical.
 
 use std::cell::Cell;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
@@ -25,8 +25,9 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde::Serialize;
 use serde_json::Value as Json;
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
-use tokio::task::block_in_place;
-use tokio::time::{Instant, timeout_at};
+use tokio::runtime::{Handle, RuntimeFlavor};
+use tokio::task::{AbortHandle, block_in_place};
+use tokio::time::{Instant, sleep, timeout_at};
 
 use super::js;
 use super::model::{self, BatchOutcome, CmdBatch, Effect, SqlTxn, TxnOutcome};
@@ -41,11 +42,13 @@ pub struct SqlConfig {
     pub producer: bool,
     /// An effect stops taking command records once its encoded size reaches this.
     pub effect_target_bytes: usize,
+    /// The node's id; random if not given.
+    pub id: Option<u64>,
 }
 
 impl Default for SqlConfig {
     fn default() -> Self {
-        Self { epoch: Duration::ZERO, max_batch_bytes: 900 * 1024, producer: false, effect_target_bytes: 512 * 1024 }
+        Self { epoch: Duration::ZERO, max_batch_bytes: 900 * 1024, producer: false, effect_target_bytes: 512 * 1024, id: None }
     }
 }
 
@@ -119,16 +122,19 @@ pub struct SqlNode {
     applier: Mutex<()>,
     progress: watch::Sender<Progress>,
     /// Outcome senders of this node's in-flight batches, by batch number.
-    waiters: StdMutex<HashMap<u64, Vec<oneshot::Sender<Outcome>>>>,
+    waiters: StdMutex<BTreeMap<u64, Vec<oneshot::Sender<Outcome>>>>,
     submit: mpsc::UnboundedSender<Pending>,
     batch_no: AtomicU64,
+    tasks: StdMutex<Vec<AbortHandle>>,
     pub stats: SqlStats,
 }
 
 impl SqlNode {
     pub fn start(cmd_log: Arc<dyn Log>, fx_log: Arc<dyn Log>, config: SqlConfig) -> Arc<Self> {
-        let id: u64 = rand::random();
-        let name = format!("{id:016x}");
+        let id = config.id.unwrap_or_else(rand::random);
+        // Unique in the process even if ids repeat, as across simulated runs.
+        static STORES: AtomicU64 = AtomicU64::new(0);
+        let name = format!("{id:016x}-{}", STORES.fetch_add(1, Relaxed));
         let store = PageStore::new();
         vfs::register_store(&name, store.clone());
         let (submit, rx) = mpsc::unbounded_channel();
@@ -144,14 +150,28 @@ impl SqlNode {
             waiters: Default::default(),
             submit,
             batch_no: AtomicU64::new(0),
+            tasks: Default::default(),
             stats: SqlStats::default(),
         });
-        tokio::spawn(node.clone().write_loop(rx));
-        tokio::spawn(node.clone().apply_loop());
+        node.spawn(node.clone().write_loop(rx));
+        node.spawn(node.clone().apply_loop());
         if node.config.producer {
-            tokio::spawn(node.clone().produce_loop());
+            node.spawn(node.clone().produce_loop());
         }
         node
+    }
+
+    fn spawn(&self, task: impl Future<Output = ()> + Send + 'static) {
+        self.tasks.lock().unwrap().push(tokio::spawn(task).abort_handle());
+    }
+
+    /// Stops the node as a crash would: its loops end wherever they are, and clients waiting
+    /// for outcomes get errors.
+    pub fn stop(&self) {
+        for t in self.tasks.lock().unwrap().drain(..) {
+            t.abort();
+        }
+        self.waiters.lock().unwrap().clear();
     }
 
     pub fn is_producer(&self) -> bool {
@@ -190,7 +210,7 @@ impl SqlNode {
     /// Runs a read-only query on a snapshot that covers command records before `min_cmd`.
     pub async fn query(&self, sql: &str, params: &[Json], min_cmd: u64) -> anyhow::Result<QueryResult> {
         self.wait_cmd(min_cmd).await;
-        block_in_place(|| {
+        in_place(|| {
             let conn = self.snapshot()?;
             let mut st = conn.prepare(sql)?;
             let columns: Vec<String> = st.column_names().map(|c| c.to_string()).collect();
@@ -340,7 +360,7 @@ impl SqlNode {
         // Commands are fetched in the background, so reading the next ones overlaps with
         // executing and publishing the current ones.
         let (tx, mut rx) = mpsc::unbounded_channel();
-        tokio::spawn(fetch_commands(self.cmd_log.clone(), tx));
+        self.spawn(fetch_commands(self.cmd_log.clone(), tx));
         // The executor connection and the version its cache reflects.
         let mut exec: Option<(Connection, u64)> = None;
         let mut buf: Vec<Record> = Vec::new();
@@ -357,6 +377,8 @@ impl SqlNode {
                 tracing::warn!("producing effect failed: {e:#}");
                 self.store.discard_pending();
                 exec = None;
+                drop(_g);
+                sleep(Duration::from_millis(200)).await;
             }
             let next = self.progress().cmd_next;
             buf.retain(|r| r.seq >= next);
@@ -368,9 +390,10 @@ impl SqlNode {
     async fn produce(&self, exec: &mut Option<(Connection, u64)>, records: &[Record]) -> anyhow::Result<()> {
         let p = self.progress();
         let records: Vec<_> = records.iter().filter(|r| r.seq >= p.cmd_next).collect();
-        if records.first().map(|r| r.seq) != Some(p.cmd_next) {
+        let Some(first) = records.first() else {
             return Ok(()); // others' effects moved us past these; wait for later records
-        }
+        };
+        anyhow::ensure!(first.seq == p.cmd_next, "next command is {}, but effects cover up to {}", first.seq, p.cmd_next);
         let base = self.store.latest();
         // The connection's page cache must reflect the latest version; reopening is the
         // simple way to get there after others' effects or a discarded attempt.
@@ -384,12 +407,15 @@ impl SqlNode {
         // over the limit is redone admitting its transactions one by one while they fit, so
         // the transactions that don't fit abort.
         let mut limit = records.len();
+        // Transactions to abort without running, by command position and index.
+        let mut doomed = BTreeMap::new();
         let (fx, body, xor_pages, cmd_to) = loop {
             let isolate = limit == 0;
             let mut outcomes = Vec::new();
             let mut cmd_to = p.cmd_next;
+            let mut redo = false;
             let conn = &exec.as_ref().unwrap().0;
-            block_in_place(|| -> anyhow::Result<()> {
+            in_place(|| -> anyhow::Result<()> {
                 // Changed pages usually compress far below their raw size, so the encoded size
                 // is only measured when the raw size crosses a doubling threshold.
                 let mut check_at = self.config.effect_target_bytes;
@@ -401,7 +427,14 @@ impl SqlNode {
                         pages.retain(|(pgno, _)| *pgno <= db_pages);
                         self.encode_effect(base, p.cmd_next, r.seq + 1, pages, db_pages, vec![b.clone()]).1.len() <= FIT_BYTES
                     };
-                    outcomes.extend(execute_record(conn, r, isolate.then_some(&fits as &dyn Fn(&BatchOutcome, u32) -> bool))?);
+                    match execute_record(conn, r, isolate.then_some(&fits as &dyn Fn(&BatchOutcome, u32) -> bool), &doomed)? {
+                        Executed::Batch(o) => outcomes.extend(o),
+                        Executed::Doomed(i, error) => {
+                            doomed.insert((r.seq, i), error);
+                            redo = true;
+                            return Ok(());
+                        }
+                    }
                     cmd_to = r.seq + 1;
                     if self.store.pending_bytes() >= check_at {
                         let (_, body, _) = self.build_effect(base, p.cmd_next, cmd_to, outcomes.clone());
@@ -413,7 +446,12 @@ impl SqlNode {
                 }
                 Ok(())
             })?;
-            let (fx, body, xor_pages) = block_in_place(|| self.build_effect(base, p.cmd_next, cmd_to, outcomes));
+            if redo {
+                self.store.discard_pending();
+                *exec = Some((open_exec(&self.name)?, base));
+                continue;
+            }
+            let (fx, body, xor_pages) = in_place(|| self.build_effect(base, p.cmd_next, cmd_to, outcomes));
             if body.len() <= MAX_EFFECT_BYTES {
                 break (fx, body, xor_pages, cmd_to);
             }
@@ -513,6 +551,15 @@ impl SqlNode {
     }
 }
 
+/// Runs blocking work on this task. A current-thread runtime, as under simulation, has no
+/// other worker to hand its tasks to.
+fn in_place<R>(f: impl FnOnce() -> R) -> R {
+    match Handle::current().runtime_flavor() {
+        RuntimeFlavor::CurrentThread => f(),
+        _ => block_in_place(f),
+    }
+}
+
 /// Streams the command log in order, from the start.
 async fn fetch_commands(log: Arc<dyn Log>, tx: mpsc::UnboundedSender<Record>) {
     let mut next = 0;
@@ -546,32 +593,45 @@ fn open_exec(name: &str) -> anyhow::Result<Connection> {
     Ok(conn)
 }
 
+enum Executed {
+    /// `None` for a duplicate batch.
+    Batch(Option<BatchOutcome>),
+    /// The transaction at this index must abort with this error, and the record must be redone
+    /// from a clean state without running it.
+    Doomed(usize, String),
+}
+
 /// Executes one command record as one SQLite transaction; each of its transactions runs in a
 /// savepoint, so a failing one is rolled back alone. With `fits`, a transaction is kept only
 /// if `fits` accepts the batch outcome with it included, its pages flushed to the store and
-/// the database's page count.
-/// Returns `None` for a duplicate batch.
-fn execute_record(conn: &Connection, r: &Record, fits: Option<&dyn Fn(&BatchOutcome, u32) -> bool>) -> anyhow::Result<Option<BatchOutcome>> {
+/// the database's page count; and any transaction that aborts is doomed, because rolling back
+/// leaves its data in reused free pages, which SQLite doesn't journal, and so in the effect.
+/// Transactions in `doomed`, by command position and index, abort without running.
+fn execute_record(conn: &Connection, r: &Record, fits: Option<&dyn Fn(&BatchOutcome, u32) -> bool>, doomed: &BTreeMap<(u64, usize), String>) -> anyhow::Result<Executed> {
     conn.execute_batch(
         "BEGIN IMMEDIATE;
          CREATE TABLE IF NOT EXISTS _sqlog_meta(id INTEGER PRIMARY KEY CHECK (id = 0), cmd_next INTEGER NOT NULL);
          CREATE TABLE IF NOT EXISTS _sqlog_writers(writer INTEGER PRIMARY KEY, batch_no INTEGER NOT NULL);",
     )?;
-    let result = (|| -> anyhow::Result<Option<BatchOutcome>> {
+    let result = (|| -> anyhow::Result<Executed> {
         let Ok(batch) = model::decode::<CmdBatch>(&r.body) else {
             tracing::warn!(seq = r.seq, "skipping undecodable command record");
-            return Ok(None);
+            return Ok(Executed::Batch(None));
         };
         let writer = batch.writer as i64;
         let last: Option<i64> = conn
             .query_row("SELECT batch_no FROM _sqlog_writers WHERE writer = ?1", [writer], |row| row.get(0))
             .optional()?;
         if last.is_some_and(|l| l as u64 >= batch.batch_no) {
-            return Ok(None);
+            return Ok(Executed::Batch(None));
         }
         conn.execute("INSERT OR REPLACE INTO _sqlog_writers VALUES (?1, ?2)", (writer, batch.batch_no as i64))?;
         let mut out = BatchOutcome { writer: batch.writer, batch_no: batch.batch_no, cmd_seq: r.seq, txns: Vec::new() };
-        for t in &batch.txns {
+        for (i, t) in batch.txns.iter().enumerate() {
+            if let Some(error) = doomed.get(&(r.seq, i)) {
+                out.txns.push(TxnOutcome::Aborted { error: error.clone() });
+                continue;
+            }
             let o = run_txn(conn, t, &mut |o| {
                 let Some(fits) = fits else { return Ok(true) };
                 conn.cache_flush()?;
@@ -581,15 +641,23 @@ fn execute_record(conn: &Connection, r: &Record, fits: Option<&dyn Fn(&BatchOutc
                 out.txns.pop();
                 Ok(ok)
             })?;
-            out.txns.push(o);
+            match o {
+                Ran::FrameLost(error) => return Ok(Executed::Doomed(i, error)),
+                Ran::Done(TxnOutcome::Aborted { error }) if fits.is_some() => return Ok(Executed::Doomed(i, error)),
+                Ran::Done(o) => out.txns.push(o),
+            }
         }
-        Ok(Some(out))
+        Ok(Executed::Batch(Some(out)))
     })();
     match result {
-        Ok(o) => {
+        Ok(Executed::Batch(o)) => {
             conn.execute("INSERT OR REPLACE INTO _sqlog_meta VALUES (0, ?1)", [(r.seq + 1) as i64])?;
             conn.execute_batch("COMMIT")?;
-            Ok(o)
+            Ok(Executed::Batch(o))
+        }
+        Ok(doomed) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Ok(doomed)
         }
         Err(e) => {
             let _ = conn.execute_batch("ROLLBACK");
@@ -598,8 +666,15 @@ fn execute_record(conn: &Connection, r: &Record, fits: Option<&dyn Fn(&BatchOutc
     }
 }
 
+enum Ran {
+    Done(TxnOutcome),
+    /// A conflict clause or trigger rolled back the whole SQLite transaction, with the record's
+    /// other transactions in it.
+    FrameLost(String),
+}
+
 /// Runs `txn` in a savepoint. It commits only if it succeeds and `fits` accepts its outcome.
-fn run_txn(conn: &Connection, txn: &SqlTxn, fits: &mut dyn FnMut(&TxnOutcome) -> anyhow::Result<bool>) -> anyhow::Result<TxnOutcome> {
+fn run_txn(conn: &Connection, txn: &SqlTxn, fits: &mut dyn FnMut(&TxnOutcome) -> anyhow::Result<bool>) -> anyhow::Result<Ran> {
     conn.execute_batch("SAVEPOINT txn")?;
     CLIENT_SQL.set(true);
     let result = (|| -> Result<TxnOutcome, String> {
@@ -627,6 +702,9 @@ fn run_txn(conn: &Connection, txn: &SqlTxn, fits: &mut dyn FnMut(&TxnOutcome) ->
         Ok(TxnOutcome::Committed { changes: conn.total_changes() - changes_before, rows, result: None })
     })();
     CLIENT_SQL.set(false);
+    if conn.is_autocommit() {
+        return Ok(Ran::FrameLost(result.err().unwrap_or_else(|| "transaction rolled back by its own statement".into())));
+    }
     let result = match result {
         Ok(o) if !fits(&o)? => Err(format!("changes exceed the {MAX_EFFECT_BYTES}-byte effect limit")),
         r => r,
@@ -634,11 +712,11 @@ fn run_txn(conn: &Connection, txn: &SqlTxn, fits: &mut dyn FnMut(&TxnOutcome) ->
     match result {
         Ok(o) => {
             conn.execute_batch("RELEASE txn")?;
-            Ok(o)
+            Ok(Ran::Done(o))
         }
         Err(error) => {
             conn.execute_batch("ROLLBACK TO txn; RELEASE txn")?;
-            Ok(TxnOutcome::Aborted { error })
+            Ok(Ran::Done(TxnOutcome::Aborted { error }))
         }
     }
 }
@@ -827,6 +905,52 @@ mod tests {
         assert!(matches!(&outcomes[1].outcome, TxnOutcome::Aborted { error } if error.contains("effect limit")));
         assert!(!aborted(&outcomes[2].outcome));
         assert!(matches!(run(&node, "SELECT count(*) FROM b").await, TxnOutcome::Committed { rows, .. } if rows == vec![vec![Json::from(2)]]));
+        assert_same(&node, &reader).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rollback_garbage_in_free_pages_does_not_halt_producers() {
+        let (cmd, fx) = logs();
+        let node = SqlNode::start(cmd.clone(), fx.clone(), SqlConfig { producer: true, ..Default::default() });
+        let reader = SqlNode::start(cmd, fx, SqlConfig::default());
+        for sql in ["CREATE TABLE b(x BLOB)", "INSERT INTO b VALUES (randomblob(800000))", "INSERT INTO b VALUES (randomblob(800000))", "DELETE FROM b"] {
+            assert!(!aborted(&run(&node, sql).await), "{sql}");
+        }
+        // Each reuses the free pages, rolls back, and leaves too much in them for one effect.
+        let o = node.execute(js("db.exec('INSERT INTO b VALUES (randomblob(1500000))'); throw new Error('boom');", Json::Null)).await.unwrap().outcome;
+        assert!(matches!(&o, TxnOutcome::Aborted { error } if error == "boom"), "{o:?}");
+        assert!(matches!(&run(&node, "INSERT INTO b VALUES (randomblob(1500000))").await, TxnOutcome::Aborted { error } if error.contains("effect limit")));
+        assert!(!aborted(&run(&node, "INSERT INTO b VALUES (1)").await));
+        assert!(matches!(run(&node, "SELECT count(*) FROM b").await, TxnOutcome::Committed { rows, .. } if rows == vec![vec![Json::from(1)]]));
+        assert_same(&node, &reader).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rolling_back_the_frame_aborts_only_that_transaction() {
+        let (cmd, fx) = logs();
+        let config = SqlConfig { producer: true, epoch: Duration::from_millis(50), ..Default::default() };
+        let node = SqlNode::start(cmd.clone(), fx.clone(), config);
+        let reader = SqlNode::start(cmd, fx, SqlConfig::default());
+        for sql in [
+            "CREATE TABLE u(x INTEGER PRIMARY KEY)",
+            "INSERT INTO u VALUES (1)",
+            "CREATE TABLE r(x)",
+            "CREATE TRIGGER rr BEFORE INSERT ON r BEGIN SELECT RAISE(ROLLBACK, 'no'); END",
+        ] {
+            assert!(!aborted(&run(&node, sql).await), "{sql}");
+        }
+        let swallow = "try { db.exec('INSERT OR ROLLBACK INTO u VALUES (1)'); } catch (e) {} db.exec('INSERT INTO u VALUES (50)');";
+        for attack in [txn("INSERT OR ROLLBACK INTO u VALUES (1)"), txn("INSERT INTO r VALUES (1)"), js(swallow, Json::Null)] {
+            // One command record: its neighbors must survive, and it must leave nothing.
+            let (a, b, c) = tokio::join!(node.execute(txn("INSERT INTO u VALUES (NULL)")), node.execute(attack), node.execute(txn("INSERT INTO u VALUES (NULL)")));
+            let outcomes = [a.unwrap(), b.unwrap(), c.unwrap()];
+            assert_eq!(outcomes[0].cmd_seq, outcomes[2].cmd_seq, "expected one command record");
+            assert!(!aborted(&outcomes[0].outcome));
+            assert!(aborted(&outcomes[1].outcome), "{:?}", outcomes[1].outcome);
+            assert!(!aborted(&outcomes[2].outcome));
+        }
+        assert!(matches!(run(&node, "SELECT count(*) FROM u").await, TxnOutcome::Committed { rows, .. } if rows == vec![vec![Json::from(7)]]));
+        assert!(matches!(run(&node, "SELECT count(*) FROM u WHERE x = 50").await, TxnOutcome::Committed { rows, .. } if rows == vec![vec![Json::from(0)]]));
         assert_same(&node, &reader).await;
     }
 
