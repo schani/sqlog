@@ -451,7 +451,11 @@ impl SqlNode {
         let (fx, cmd, snap) = (self.fx_log.clone(), self.cmd_log.clone(), self.snap_log.clone());
         self.spawn(async move {
             // A trim that fails is covered by the next one.
-            for (log, seq) in [(fx, Some(p.version)), (cmd, Some(p.cmd_next)), (snap, p.chunks.first().copied())] {
+            let snap_seq = snap_trim_point(&snap, &p).await.unwrap_or_else(|e| {
+                tracing::warn!("finding where to trim snapshots failed: {e:#}");
+                None
+            });
+            for (log, seq) in [(fx, Some(p.version)), (cmd, Some(p.cmd_next)), (snap, snap_seq)] {
                 if let Some(seq) = seq
                     && let Err(e) = log.trim(seq).await
                 {
@@ -641,8 +645,8 @@ impl SqlNode {
                     };
                     match execute_record(conn, r, isolate.then_some(&fits as &dyn Fn(&BatchOutcome, u32) -> bool), &doomed)? {
                         Executed::Batch(o) => outcomes.extend(o),
-                        Executed::Doomed(i, error) => {
-                            doomed.insert((r.seq, i), error);
+                        Executed::Doomed(found) => {
+                            doomed.extend(found.into_iter().map(|(i, error)| ((r.seq, i), error)));
                             redo = true;
                             return Ok(());
                         }
@@ -751,7 +755,7 @@ impl SqlNode {
                 if r.seq != self.progress().fx_next {
                     continue;
                 }
-                let theirs = self.apply_effect(r).context("applying effect")?;
+                let Some(theirs) = self.apply_effect(r) else { continue };
                 if let Some(m) = mine.filter(|m| m.base == r.seq && (m.cmd_from, m.cmd_to) == (theirs.cmd_from, theirs.cmd_to)) {
                     let counter = if m.digest == theirs.digest { &self.stats.verified } else { &self.stats.diverged };
                     counter.fetch_add(1, Relaxed);
@@ -771,6 +775,27 @@ fn in_place<R>(f: impl FnOnce() -> R) -> R {
         RuntimeFlavor::CurrentThread => f(),
         _ => block_in_place(f),
     }
+}
+
+/// Where to trim the snapshot log as the effect log is trimmed to snapshot `p`: before `p`'s
+/// chunks, but not before a chunk of `p`'s version or later. Chunks don't land in version
+/// order, so one of a newer snapshot may precede `p`'s, and only the effect log's trim makes
+/// the older chunks useless.
+async fn snap_trim_point(log: &Arc<dyn Log>, p: &Manifest) -> anyhow::Result<Option<u64>> {
+    let Some(&end) = p.chunks.first() else { return Ok(None) };
+    let mut next = 0;
+    while next < end {
+        let records = log.read(next, Duration::ZERO).await?;
+        let Some(last) = records.last() else { break };
+        for r in records.iter().filter(|r| r.seq < end && !r.command) {
+            let c: SnapChunk = model::decode(&r.body).with_context(|| format!("snapshot chunk at {}", r.seq))?;
+            if c.version >= p.version {
+                return Ok(Some(r.seq));
+            }
+        }
+        next = last.seq + 1;
+    }
+    Ok(Some(end))
 }
 
 /// Streams the command log in order, from the start.
@@ -809,9 +834,9 @@ fn open_exec(name: &str) -> anyhow::Result<Connection> {
 enum Executed {
     /// `None` for a duplicate batch.
     Batch(Option<BatchOutcome>),
-    /// The transaction at this index must abort with this error, and the record must be redone
-    /// from a clean state without running it.
-    Doomed(usize, String),
+    /// The transactions at these indexes must abort with these errors, and the record must be
+    /// redone from a clean state without running them.
+    Doomed(Vec<(usize, String)>),
 }
 
 /// Executes one command record as one SQLite transaction; each of its transactions runs in a
@@ -819,6 +844,8 @@ enum Executed {
 /// if `fits` accepts the batch outcome with it included, its pages flushed to the store and
 /// the database's page count; and any transaction that aborts is doomed, because rolling back
 /// leaves its data in reused free pages, which SQLite doesn't journal, and so in the effect.
+/// Execution goes on past a doomed transaction to find the others that fail, since that data
+/// changes no outcome; but sizes then include it, so the first that doesn't fit ends the run.
 /// Transactions in `doomed`, by command position and index, abort without running.
 fn execute_record(conn: &Connection, r: &Record, fits: Option<&dyn Fn(&BatchOutcome, u32) -> bool>, doomed: &BTreeMap<(u64, usize), String>) -> anyhow::Result<Executed> {
     conn.execute_batch(
@@ -843,6 +870,7 @@ fn execute_record(conn: &Connection, r: &Record, fits: Option<&dyn Fn(&BatchOutc
         }
         conn.execute("INSERT OR REPLACE INTO _sqlog_writers VALUES (?1, ?2)", (writer, batch.batch_no as i64))?;
         let mut out = BatchOutcome { writer: batch.writer, batch_no: batch.batch_no, cmd_seq: r.seq, txns: Vec::new() };
+        let mut found = Vec::new();
         for (i, t) in batch.txns.iter().enumerate() {
             if let Some(error) = doomed.get(&(r.seq, i)) {
                 out.txns.push(TxnOutcome::Aborted { error: error.clone() });
@@ -858,10 +886,18 @@ fn execute_record(conn: &Connection, r: &Record, fits: Option<&dyn Fn(&BatchOutc
                 Ok(ok)
             })?;
             match o {
-                Ran::FrameLost(error) => return Ok(Executed::Doomed(i, error)),
-                Ran::Done(TxnOutcome::Aborted { error }) if fits.is_some() => return Ok(Executed::Doomed(i, error)),
+                Ran::FrameLost(error) => {
+                    found.push((i, error));
+                    return Ok(Executed::Doomed(found));
+                }
+                Ran::TooBig(_) if !found.is_empty() => return Ok(Executed::Doomed(found)),
+                Ran::TooBig(error) => found.push((i, error)),
+                Ran::Done(TxnOutcome::Aborted { error }) if fits.is_some() => found.push((i, error)),
                 Ran::Done(o) => out.txns.push(o),
             }
+        }
+        if !found.is_empty() {
+            return Ok(Executed::Doomed(found));
         }
         Ok(Executed::Batch(Some(out)))
     })();
@@ -887,6 +923,8 @@ enum Ran {
     /// A conflict clause or trigger rolled back the whole SQLite transaction, with the record's
     /// other transactions in it.
     FrameLost(String),
+    /// It succeeded, but `fits` rejected it, so it was rolled back.
+    TooBig(String),
 }
 
 /// Runs `txn` in a savepoint. It commits only if it succeeds and `fits` accepts its outcome.
@@ -921,10 +959,12 @@ fn run_txn(conn: &Connection, txn: &SqlTxn, fits: &mut dyn FnMut(&TxnOutcome) ->
     if conn.is_autocommit() {
         return Ok(Ran::FrameLost(result.err().unwrap_or_else(|| "transaction rolled back by its own statement".into())));
     }
-    let result = match result {
-        Ok(o) if !fits(&o)? => Err(format!("changes exceed the {MAX_EFFECT_BYTES}-byte effect limit")),
-        r => r,
-    };
+    if let Ok(o) = &result
+        && !fits(o)?
+    {
+        conn.execute_batch("ROLLBACK TO txn; RELEASE txn")?;
+        return Ok(Ran::TooBig(format!("changes exceed the {MAX_EFFECT_BYTES}-byte effect limit")));
+    }
     match result {
         Ok(o) => {
             conn.execute_batch("RELEASE txn")?;
@@ -938,8 +978,10 @@ fn run_txn(conn: &Connection, txn: &SqlTxn, fits: &mut dyn FnMut(&TxnOutcome) ->
 }
 
 /// Client SQL may not frame transactions, attach files, run pragmas, load extensions, or
-/// change SQLog's own tables, which hold dedup state and progress. Applies while `CLIENT_SQL`
-/// is set; SQLog's own statements run unchecked.
+/// change SQLog's own tables, which hold dedup state and progress. Nor may it create temp
+/// objects or read `total_changes()`: they outlive the transaction in the executor connection,
+/// outside the database, so later transactions would see state the log doesn't hold. Applies
+/// while `CLIENT_SQL` is set; SQLog's own statements run unchecked.
 fn authorize(ctx: AuthContext<'_>) -> Authorization {
     use AuthAction::*;
     if !CLIENT_SQL.get() {
@@ -948,12 +990,14 @@ fn authorize(ctx: AuthContext<'_>) -> Authorization {
     let internal = |t: &str| t.get(..7).is_some_and(|p| p.eq_ignore_ascii_case("_sqlog_"));
     match ctx.action {
         Transaction { .. } | Savepoint { .. } | Attach { .. } | Detach { .. } | Pragma { .. } => Authorization::Deny,
-        Function { function_name } if function_name.eq_ignore_ascii_case("load_extension") => Authorization::Deny,
+        CreateTempIndex { .. } | CreateTempTable { .. } | CreateTempTrigger { .. } | CreateTempView { .. } => Authorization::Deny,
+        Read { .. } => Authorization::Allow,
+        _ if ctx.database_name.is_some_and(|d| d.eq_ignore_ascii_case("temp")) => Authorization::Deny,
+        Function { function_name } if ["load_extension", "total_changes"].iter().any(|f| function_name.eq_ignore_ascii_case(f)) => {
+            Authorization::Deny
+        }
         CreateIndex { table_name, .. }
         | CreateTable { table_name }
-        | CreateTempIndex { table_name, .. }
-        | CreateTempTable { table_name }
-        | CreateTempTrigger { table_name, .. }
         | CreateTrigger { table_name, .. }
         | Delete { table_name }
         | DropIndex { table_name, .. }
@@ -1061,6 +1105,25 @@ mod tests {
         assert!(!aborted(&run(&node, "INSERT INTO kv VALUES ('a', 1)").await));
         assert!(matches!(run(&node, "SELECT count(*) FROM _sqlog_writers").await, TxnOutcome::Committed { rows, .. } if rows == vec![vec![Json::from(1)]]));
         assert_same(&node, &reader).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn client_sql_cannot_keep_connection_state() {
+        let node = SqlNode::start(logs(), SqlConfig { producer: true, ..Default::default() });
+        assert!(!aborted(&run(&node, "CREATE TABLE kv(k TEXT PRIMARY KEY, v INTEGER)").await));
+        for sql in [
+            "CREATE TEMP TABLE t(x)",
+            "CREATE TABLE temp.t(x)",
+            "CREATE TEMP VIEW v AS SELECT 1",
+            "CREATE TEMP TRIGGER t AFTER INSERT ON kv BEGIN SELECT 1; END",
+            "CREATE VIRTUAL TABLE temp.f USING fts5(a)",
+            "SELECT total_changes()",
+        ] {
+            assert!(aborted(&run(&node, sql).await), "{sql} was allowed");
+        }
+        let o = node.execute(js("db.exec('CREATE TEMP TABLE t(x)')", Json::Null)).await.unwrap().outcome;
+        assert!(aborted(&o), "{o:?}");
+        assert!(!aborted(&run(&node, "CREATE VIRTUAL TABLE f USING fts5(a)").await));
     }
 
     fn js(code: &str, args: Json) -> SqlTxn {

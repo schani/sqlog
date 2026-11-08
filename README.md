@@ -116,11 +116,11 @@ All 48 runs (S2 and in-memory): every node identical, money conserved. With 10% 
 Details:
 
 - **VFS** (`vfs.rs`): SQLite reads and writes pages through a custom VFS backed by the page store. The producer's connection writes into a pending overlay that becomes the next version when its effect lands. Query connections pin the latest version when SQLite takes its shared lock, so a read transaction sees one version while new ones are installed.
-- **Execution:** one SQLite transaction per command record; each client transaction runs in a savepoint, so a failing one (constraint violation, SQL error) aborts alone. A SQLite authorizer rejects transaction control, `ATTACH`, pragmas, `load_extension`, and writes to SQLog's own `_sqlog_*` tables, including writes from triggers.
+- **Execution:** one SQLite transaction per command record; each client transaction runs in a savepoint, so a failing one (constraint violation, SQL error) aborts alone. A SQLite authorizer rejects transaction control, `ATTACH`, pragmas, `load_extension`, and writes to SQLog's own `_sqlog_*` tables, including writes from triggers. It also rejects temp tables, views and triggers and `total_changes()`: they live in the producer's connection rather than in the database, so later transactions would depend on which producer ran them.
 - **JavaScript transactions** (`js.rs`): instead of statements, a transaction can be JavaScript run on QuickJS as a function body with `args` and `db` in scope. `db.query(sql, params)` returns rows as objects, `db.exec(sql, params)` the number of rows changed; the return value, as JSON, is the transaction's result, and a throw aborts it. Each thread keeps one context, frozen after setup so transactions can't leave state behind; promise jobs run before the transaction ends. Memory, stack and operation limits abort runaway code.
 - **Dedup and progress live in the database:** `_sqlog_writers` holds each writer's last batch number, `_sqlog_meta` the next command position. Both change in the same transaction as the commands, so they travel with the pages.
-- **Effects:** each page is stored in full or as XOR against its previous version, whichever leaves fewer non-zero bytes; the whole record is MessagePack compressed with zstd. Commands are compressed the same way. An effect stops taking command records at ~512 KB encoded. An effect over 1 MB (S2's record limit) is redone on half as many command records; a single record still over the limit is redone admitting its transactions one at a time, and those that don't fit abort. Each such abort restarts the record from a clean state without that transaction, because rolling back leaves its data in reused free pages, which SQLite doesn't journal. The same restart handles a statement that rolls back the whole SQLite transaction (`INSERT OR ROLLBACK`, `RAISE(ROLLBACK)`). Effects don't spill to object storage yet.
-- **Snapshots and trimming:** with `--snapshot-every N`, a node snapshots each time effects cover N more command records; every node picks the same versions, so whichever announces first wins and the others stop. Snapshots are full copies of the pages, written in chunks of 200 pages to the snapshot log, then announced with a manifest on the effect log, so every node sees them in order. When a node sees its own snapshot announced, it trims the effect and command logs to the snapshot before, and the snapshot log to that snapshot's first chunk. A node whose next effect was trimmed (it just started, or fell behind) loads the newest complete snapshot and goes on from there; clients waiting on it for outcomes get errors. S2 trims by appending a command record, so trims and announcements are versions that change nothing, keeping version and effect position equal.
+- **Effects:** each page is stored in full or as XOR against its previous version, whichever leaves fewer non-zero bytes; the whole record is MessagePack compressed with zstd. Commands are compressed the same way. An effect stops taking command records at ~512 KB encoded. An effect over 1 MB (S2's record limit) is redone on half as many command records; a single record still over the limit is redone admitting its transactions one at a time, and those that don't fit abort. An abort restarts the record from a clean state without the aborted transactions, because rolling back leaves their data in reused free pages, which SQLite doesn't journal. Before restarting, execution goes on to find the other transactions that fail, since that data changes no outcome, so a record restarts about once rather than once per abort; sizes include the data, though, so the first transaction that doesn't fit ends the run. The same restart handles a statement that rolls back the whole SQLite transaction (`INSERT OR ROLLBACK`, `RAISE(ROLLBACK)`). Effects don't spill to object storage yet.
+- **Snapshots and trimming:** with `--snapshot-every N`, a node snapshots each time effects cover N more command records; every node picks the same versions, so whichever announces first wins and the others stop. Snapshots are full copies of the pages, written in chunks of 200 pages to the snapshot log, then announced with a manifest on the effect log, so every node sees them in order. When a node sees its own snapshot announced, it trims the effect and command logs to the snapshot before, and the snapshot log to that snapshot's first chunk, or to an earlier chunk of that version or later: chunks don't land in version order, since a slow node may write an old snapshot after newer ones. A node whose next effect was trimmed (it just started, or fell behind) loads the newest complete snapshot and goes on from there; clients waiting on it for outcomes get errors. S2 trims by appending a command record, so trims and announcements are versions that change nothing, keeping version and effect position equal.
 
 ```bash
 ./target/release/sqlog sql-bench                                    # in-memory logs
@@ -167,10 +167,10 @@ All runs pass. S2 appends took 60–90 ms during these runs (laptop), about twic
 ```
 
 - **Faults:** dropped appends, lost acks, appends that report failure and land up to 5 s later, read errors, short and empty reads, latency spikes, 1 MB record limit, trims that take effect up to 2 s late, node crashes (including all at once), node partitions and log outages. Rates, cluster shape and snapshot interval come from the seed.
-- **Workload:** list-append transactions in JavaScript and SQL, planned aborts, DDL, transactions that go over the effect limit, SQL that attacks the transaction frame, and queries at three consistency levels.
+- **Workload:** list-append transactions in JavaScript and SQL, planned aborts, DDL, transactions that go over the effect limit, SQL that attacks the transaction frame or leaves a temp trigger behind, and queries at three consistency levels.
 - **Checks:** an Elle-style black-box checker (`checker.rs`) infers dependencies from what clients read and looks for G0, G1a, G1b, G1c, G-single, G2 and real-time cycles, lost writes, and partial effects of transactions with unknown outcomes. Read-write transactions must be strictly serializable. After faults stop, nodes must converge to identical bytes, a node started then must catch up from the trimmed logs, no operation may be stuck, and an audit of both logs must show every batch ran at most once and every snapshot covers what its effects did.
 
-Latest sweep: 3,000 seeds of 30 virtual seconds in 303 s, with 930k commits, 105k aborts, 68k unknown outcomes, 376k queries, 30.6k crashes, 10.7k partitions, 4.4k outages, 106k snapshots, 24k restores and 550k effect log records trimmed; all pass. 300 seeds run twice gave identical traces.
+Latest sweep: 3,000 seeds of 30 virtual seconds, with 1.02M commits, 116k aborts, 69k unknown outcomes, 412k queries, 30.6k crashes, 10.6k partitions, 4.5k outages, 128k snapshots, 24k restores and 679k effect log records trimmed; all pass. 300 seeds run twice gave identical traces.
 
 Planted bugs, 60 seeds each (snapshot bugs with the current shape draws, the others before snapshots existed):
 
@@ -189,12 +189,35 @@ Planted bugs, 60 seeds each (snapshot bugs with the current shape draws, the oth
 | Snapshot's command position off by one | 47 | audit |
 | Snapshot labeled one version late | 47 | audit, garbage reads, lost writes |
 | Effects trimmed past the newest snapshot | 47 | late node stuck, lost writes |
+| Temp objects allowed | 51 | aborts that committed, garbage reads |
 
 The 13 seeds that miss each snapshot bug take no snapshots.
 
 Not reloading the executor after others' effects goes unnoticed, correctly: SQLite resets its cache when page 1's change counter differs, so the reopen in `produce` is only defensive.
 
 Limits: tasks never run in parallel, so thread races between queries and the applier are out of reach; SQL takes no virtual time; and the log is assumed linearizable and durable, so this says nothing about S2 itself. Clients don't retry unknown outcomes, since there are no idempotency keys.
+
+## Model
+
+`tla/SQLog.tla` is a TLA+ spec of the log protocol: writers whose appends may land late or twice, producers racing conditional appends, nodes applying the effect log, snapshots written to the snapshot log and announced on the effect log, trims that take effect late, restores, and crashes. The database is the sequence of batches executed, and an effect carries the batches it adds, as a page delta does, so a node holding the wrong state stays wrong. Invariants:
+
+- every effect follows the one before it and holds what executing its commands adds, so each batch runs at most once, in command log order;
+- every node holds the state its version names;
+- every snapshot holds the state, and covers the commands, of its version;
+- a node starting now can catch up, from the effect log or from a complete snapshot;
+- a producer at the tail finds the commands it has to execute next.
+
+```bash
+java -cp tla2tools.jar tlc2.TLC -workers auto -config SQLogSmall.cfg SQLog.tla       # exhaustive, 2 nodes
+java -cp tla2tools.jar tlc2.TLC -simulate num=2000000 -depth 80 -config SQLogSim.cfg SQLog.tla  # random, 3 nodes, crashes
+java -cp tla2tools.jar tlc2.TLC -config Witness-chunk.cfg SQLogWitness.tla           # the counterexample below
+```
+
+The model found a bug the simulation hadn't. Trimming the snapshot log to the previous snapshot's first chunk assumed chunks land in version order. They don't: in `SQLogWitness.tla`, three nodes snapshot versions 1, 2 and 3, and version 1's chunk lands last. Two announcements later, the snapshot log is trimmed past the chunks of versions 2 and 3 and the effect log to version 2, so a node starting then finds no snapshot to restore, and on an idle database never will. The snapshot log is now trimmed no further than the first chunk of the trimmed-to version or later (`SnapTrim = "version"`), which only drops chunks no restore can use, whatever any node believes the newest snapshot is.
+
+With that rule, the exhaustive check covers 302M distinct states (2 nodes, 2 batches, 1 crash, up to 5 effect records) in 1 h 45 min, and 3.4M random traces of up to 80 steps (3 nodes, 2 crashes, up to 12 effect records) find nothing; the witness runs to its end with every invariant holding. Under the old rule (`Witness-chunk.cfg`) it violates `Recoverable`.
+
+Limits: one chunk per snapshot; no lost or duplicated trim, chunk or manifest appends beyond trims failing; logs bounded to a dozen records.
 
 ## Not yet
 

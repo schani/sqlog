@@ -327,7 +327,7 @@ fn plan_hostile(cl: &Cluster, rng: &mut StdRng) -> Plan {
     let (key, val) = (rng.gen_range(0..cl.keys), cl.val());
     let append = Mop::Append { key, val };
     let args = json!([key, val.to_string()]);
-    match rng.gen_range(0..4) {
+    match rng.gen_range(0..5) {
         // The conflict rolls back the whole SQLite transaction, not just this statement.
         0 => Plan { txn: stmts(vec![(APPEND, args), ("INSERT OR ROLLBACK INTO u VALUES (1)", json!([]))]), mops: vec![append], expect: Expect::Abort },
         1 => Plan { txn: stmts(vec![(APPEND, args), ("INSERT INTO r VALUES (1)", json!([]))]), mops: vec![append], expect: Expect::Abort },
@@ -335,6 +335,13 @@ fn plan_hostile(cl: &Cluster, rng: &mut StdRng) -> Plan {
             txn: SqlTxn { js: Some(JS_ROLLBACK_AND_CONTINUE.into()), args: json!({ "k": key, "v": val.to_string() }), ..Default::default() },
             mops: vec![append],
             expect: Expect::Either,
+        },
+        // A temp trigger would outlive the transaction in one producer's connection and
+        // change later appends there only.
+        3 => Plan {
+            txn: stmts(vec![(APPEND, args), ("CREATE TEMP TRIGGER IF NOT EXISTS tt AFTER UPDATE ON la BEGIN UPDATE la SET v = v || ',0' WHERE k = new.k AND v NOT LIKE '%,0'; END", json!([]))]),
+            mops: vec![append],
+            expect: Expect::Abort,
         },
         _ => Plan { txn: stmts(vec![(APPEND, args), ("VACUUM", json!([]))]), mops: vec![append], expect: Expect::Abort },
     }
