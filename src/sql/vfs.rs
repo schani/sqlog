@@ -81,6 +81,19 @@ impl PageStore {
         self.inner.lock().unwrap().latest
     }
 
+    /// The database's size in pages at the latest version.
+    pub fn latest_size(&self) -> u32 {
+        let s = self.inner.lock().unwrap();
+        s.size_at(s.latest)
+    }
+
+    /// The latest version's pages, in order, with zeros for pages never written.
+    pub fn capture(&self) -> Vec<Page> {
+        let s = self.inner.lock().unwrap();
+        let zero: Page = vec![0; PAGE_SIZE].into();
+        (1..=s.size_at(s.latest)).map(|pgno| s.page_at(pgno, s.latest).unwrap_or(&zero).clone()).collect()
+    }
+
     /// The latest committed version of a page.
     pub fn latest_page(&self, pgno: u32) -> Option<Page> {
         let s = self.inner.lock().unwrap();
@@ -183,8 +196,14 @@ impl PageStore {
 
     /// Installs `pages` as the next version and drops versions no snapshot can see.
     pub fn install(&self, pages: Vec<(u32, Page)>, size: u32) -> u64 {
+        let v = self.latest() + 1;
+        self.install_at(v, pages, size)
+    }
+
+    /// Installs `pages` as version `v`, which must be past the latest.
+    pub fn install_at(&self, v: u64, pages: Vec<(u32, Page)>, size: u32) -> u64 {
         let mut s = self.inner.lock().unwrap();
-        let v = s.latest + 1;
+        assert!(v > s.latest, "version {v} is not past {}", s.latest);
         s.latest = v;
         s.sizes.push((v, size));
         let floor = s.pins.keys().next().copied().unwrap_or(v).min(v);
@@ -201,18 +220,18 @@ impl PageStore {
 
     /// Digest of the whole database at the latest version.
     pub fn digest(&self) -> u64 {
-        let s = self.inner.lock().unwrap();
-        let size = s.size_at(s.latest);
-        let mut h = Xxh3::new();
-        h.update(&size.to_le_bytes());
-        for pgno in 1..=size {
-            match s.page_at(pgno, s.latest) {
-                Some(p) => h.update(p),
-                None => h.update(&[0; PAGE_SIZE]),
-            }
-        }
-        h.digest()
+        digest(&self.capture())
     }
+}
+
+/// Digest of a whole database, given its pages in order.
+pub fn digest(pages: &[Page]) -> u64 {
+    let mut h = Xxh3::new();
+    h.update(&(pages.len() as u32).to_le_bytes());
+    for p in pages {
+        h.update(p);
+    }
+    h.digest()
 }
 
 // --- VFS -------------------------------------------------------------------------------

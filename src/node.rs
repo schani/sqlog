@@ -266,7 +266,7 @@ impl Node {
         if let Err(e) = self.catch_up(seq).await {
             return fail(waiters, &e);
         }
-        self.apply(&[Record { seq, body }]);
+        self.apply(&[Record { seq, body, command: false }]);
         drop(guard);
         let Some((seq, outcomes)) = self.own_outcomes.lock().unwrap().remove(&batch_no) else {
             return fail(waiters, &anyhow!("batch {batch_no} was not applied"));

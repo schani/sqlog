@@ -13,7 +13,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex, Once};
 use std::time::Duration;
 
-use bytes::Bytes;
 use rand::rngs::StdRng;
 use rand::{Rng, RngCore, SeedableRng};
 use serde::{Deserialize, Serialize};
@@ -24,9 +23,9 @@ use xxhash_rust::xxh3::xxh3_64;
 
 use super::checker::{self, Mop, Op, Order, Status};
 use super::log::{Bug, Faults, MAX_GHOST, Net, SimLog, Stream};
-use crate::log::Log;
-use crate::sql::model::{self, CmdBatch, Effect, SqlTxn, Stmt, TxnOutcome};
-use crate::sql::node::{SqlConfig, SqlNode};
+use crate::log::{Log, Record};
+use crate::sql::model::{self, CmdBatch, Effect, FxRecord, SqlTxn, Stmt, TxnOutcome};
+use crate::sql::node::{Logs, SqlConfig, SqlNode};
 
 #[derive(Clone, Debug)]
 pub struct Options {
@@ -54,6 +53,10 @@ pub struct Report {
     pub effects: u64,
     pub lost_races: u64,
     pub verified: u64,
+    pub snapshots: u64,
+    pub restores: u64,
+    /// Effect log records trimmed by the end.
+    pub trimmed: u64,
     pub virtual_secs: u64,
 }
 
@@ -128,12 +131,14 @@ fn collect_panics() {
 
 struct Slot {
     producer: bool,
+    snapshots: bool,
     node: Option<Arc<SqlNode>>,
 }
 
 struct Cluster {
     cmd: Arc<Stream>,
     fx: Arc<Stream>,
+    snap: Arc<Stream>,
     net: Arc<Net>,
     config: SqlConfig,
     slots: Mutex<Vec<Slot>>,
@@ -160,11 +165,17 @@ impl Cluster {
     }
 
     fn boot(&self, slot: usize) {
+        let mut slots = self.slots.lock().unwrap();
+        let (producer, snapshots) = (slots[slot].producer, slots[slot].snapshots);
+        slots[slot].node = Some(self.start(producer, snapshots));
+    }
+
+    fn start(&self, producer: bool, snapshots: bool) -> Arc<SqlNode> {
         let id = self.ids.lock().unwrap().next_u64();
         let log = |stream: &Arc<Stream>| -> Arc<dyn Log> { Arc::new(SimLog { stream: stream.clone(), net: self.net.clone(), node: id }) };
-        let mut slots = self.slots.lock().unwrap();
-        let producer = slots[slot].producer;
-        slots[slot].node = Some(SqlNode::start(log(&self.cmd), log(&self.fx), SqlConfig { id: Some(id), producer, ..self.config.clone() }));
+        let logs = Logs { cmd: log(&self.cmd), fx: log(&self.fx), snap: log(&self.snap) };
+        let snapshot_every = if snapshots { self.config.snapshot_every } else { 0 };
+        SqlNode::start(logs, SqlConfig { id: Some(id), producer, snapshot_every, ..self.config.clone() })
     }
 
     fn crash(&self, slot: usize) {
@@ -180,6 +191,8 @@ impl Cluster {
         let mut r = self.report.lock().unwrap();
         r.lost_races += s.lost_races.load(Relaxed);
         r.verified += s.verified.load(Relaxed);
+        r.snapshots += s.snapshots.load(Relaxed);
+        r.restores += s.restores.load(Relaxed);
         let diverged = s.diverged.load(Relaxed);
         drop(r);
         if diverged > 0 {
@@ -496,16 +509,20 @@ async fn simulate(seed: u64, opts: &Options) -> (Report, Vec<Op>) {
         epoch: Duration::from_millis(shape.gen_range(0..20)),
         max_batch_bytes: [4 << 10, 64 << 10, 900 << 10][shape.gen_range(0..3)],
         effect_target_bytes: [16 << 10, 128 << 10, 512 << 10][shape.gen_range(0..3)],
+        snapshot_every: [0, 2, 10, 40][shape.gen_range(0..4)],
         ..Default::default()
     };
     let producers = shape.gen_range(1..=3);
     let others = shape.gen_range(0..=3);
+    let mut snapshots: Vec<bool> = (0..producers + others).map(|_| shape.gen_bool(0.5)).collect();
+    snapshots[0] = true;
     let cl = Arc::new(Cluster {
         cmd: Default::default(),
         fx: Default::default(),
+        snap: Default::default(),
         net: net.clone(),
         config,
-        slots: Mutex::new((0..producers + others).map(|i| Slot { producer: i < producers, node: None }).collect()),
+        slots: Mutex::new((0..producers + others).map(|i| Slot { producer: i < producers, snapshots: snapshots[i], node: None }).collect()),
         ids: Mutex::new(sub(3)),
         stop: AtomicBool::new(false),
         clock: AtomicU64::new(0),
@@ -540,18 +557,39 @@ async fn simulate(seed: u64, opts: &Options) -> (Report, Vec<Op>) {
         c.await.expect("client");
     }
 
-    // Requests still in the network land, then every node must reach the tail.
+    // Requests still in the network land, then every node must reach the tail and the logs
+    // must stop growing, as snapshots and their trims go on adding records for a while.
     sleep(MAX_GHOST).await;
     let deadline = Instant::now() + CONVERGE_TIMEOUT;
     let nodes = cl.nodes();
     let at_tail = |n: &SqlNode| n.progress().fx_next == cl.fx.len() && n.progress().cmd_next == cl.cmd.len();
-    while !nodes.iter().all(|n| at_tail(n)) && Instant::now() < deadline {
-        sleep(Duration::from_millis(100)).await;
+    while Instant::now() < deadline {
+        if !nodes.iter().all(|n| at_tail(n)) {
+            sleep(Duration::from_millis(100)).await;
+            continue;
+        }
+        let tails = (cl.cmd.len(), cl.fx.len(), cl.snap.len());
+        sleep(Duration::from_secs(5)).await;
+        if tails == (cl.cmd.len(), cl.fx.len(), cl.snap.len()) && nodes.iter().all(|n| at_tail(n)) {
+            break;
+        }
     }
     if !nodes.iter().all(|n| at_tail(n)) {
         let at: Vec<_> = nodes.iter().map(|n| (n.progress().cmd_next, n.progress().fx_next)).collect();
         cl.fail(format!("no convergence: nodes at (cmd, fx) {at:?}, logs at ({}, {})", cl.cmd.len(), cl.fx.len()));
     }
+
+    // A node that starts now must catch up from what's left of the logs.
+    let late = cl.start(false, false);
+    let deadline = Instant::now() + CONVERGE_TIMEOUT;
+    while !at_tail(&late) && Instant::now() < deadline {
+        sleep(Duration::from_millis(100)).await;
+    }
+    if !at_tail(&late) {
+        let p = late.progress();
+        cl.fail(format!("late node stuck at (cmd, fx) ({}, {}), logs at ({}, {}) from ({}, {})", p.cmd_next, p.fx_next, cl.cmd.len(), cl.fx.len(), cl.cmd.start(), cl.fx.start()));
+    }
+    let nodes: Vec<_> = nodes.into_iter().chain([late]).collect();
 
     // Final reads: every acknowledged write must be there, on every node.
     let keys: Vec<u64> = (0..cl.keys).collect();
@@ -563,7 +601,8 @@ async fn simulate(seed: u64, opts: &Options) -> (Report, Vec<Op>) {
     }
     let digests: BTreeSet<u64> = nodes.iter().map(|n| n.digest()).collect();
     if digests.len() > 1 {
-        cl.fail(format!("nodes hold different bytes: {digests:x?}"));
+        let by_node: Vec<_> = nodes.iter().map(|n| format!("{:016x}: {:016x} after {} restores", n.id, n.digest(), n.stats.restores.load(Relaxed))).collect();
+        cl.fail(format!("nodes hold different bytes: {by_node:?}"));
     }
     for n in &nodes {
         match n.query("PRAGMA integrity_check", &[], 0).await {
@@ -589,6 +628,7 @@ async fn simulate(seed: u64, opts: &Options) -> (Report, Vec<Op>) {
     report.seed = seed;
     report.cmd_records = cmd.len() as u64;
     report.effects = fx.len() as u64;
+    report.trimmed = cl.fx.start();
     report.virtual_secs = start.elapsed().as_secs();
     report.failures = std::mem::take(&mut *cl.failures.lock().unwrap());
     let digest = digests.iter().next().copied().unwrap_or(0);
@@ -596,10 +636,10 @@ async fn simulate(seed: u64, opts: &Options) -> (Report, Vec<Op>) {
     (report, history)
 }
 
-fn trace(cmd: &[Bytes], fx: &[Bytes], history: &[Op], digest: u64) -> u64 {
+fn trace(cmd: &[Record], fx: &[Record], history: &[Op], digest: u64) -> u64 {
     let mut all = serde_json::to_vec(history).expect("history encodes");
     for r in cmd.iter().chain(fx) {
-        all.extend_from_slice(&xxh3_64(r).to_le_bytes());
+        all.extend_from_slice(&xxh3_64(&r.body).to_le_bytes());
     }
     all.extend_from_slice(&digest.to_le_bytes());
     xxh3_64(&all)
@@ -608,17 +648,32 @@ fn trace(cmd: &[Bytes], fx: &[Bytes], history: &[Op], digest: u64) -> u64 {
 /// Checks the logs themselves: effects chain without gaps, cover every command record in order,
 /// and report each batch at most once, on the record they say. A batch without an outcome must
 /// have landed after a later batch of the same writer, which only a writer that gave up on it
-/// can cause.
-fn audit(cmd: &[Bytes], fx: &[Bytes]) -> Vec<String> {
+/// can cause. A snapshot must cover the command records that effects before it cover.
+fn audit(cmd: &[Record], fx: &[Record]) -> Vec<String> {
     let mut out = Vec::new();
-    let batches: Vec<Option<CmdBatch>> = cmd.iter().map(|b| model::decode(b).ok()).collect();
+    let batches: Vec<Option<CmdBatch>> = cmd.iter().map(|r| if r.command { None } else { model::decode(&r.body).ok() }).collect();
     let mut covered = 0;
+    // Command records covered at each version.
+    let mut covered_at = vec![0];
     let mut reported: BTreeSet<(u64, u64)> = BTreeSet::new();
-    for (i, body) in fx.iter().enumerate() {
-        let e: Effect = match model::decode(body) {
-            Ok(e) => e,
-            Err(err) => {
+    for (i, r) in fx.iter().enumerate() {
+        let record = if r.command { None } else { Some(model::decode::<FxRecord>(&r.body)) };
+        let e: Effect = match record {
+            Some(Ok(FxRecord::Effect(e))) => e,
+            Some(Ok(FxRecord::Snapshot(m))) => {
+                if covered_at.get(m.version as usize) != Some(&m.cmd_next) {
+                    out.push(format!("snapshot of version {} covers {} command records, its effects {:?}", m.version, m.cmd_next, covered_at.get(m.version as usize)));
+                }
+                covered_at.push(covered);
+                continue;
+            }
+            None => {
+                covered_at.push(covered);
+                continue;
+            }
+            Some(Err(err)) => {
                 out.push(format!("effect {i} doesn't decode: {err:#}"));
+                covered_at.push(covered);
                 continue;
             }
         };
@@ -629,6 +684,7 @@ fn audit(cmd: &[Bytes], fx: &[Bytes]) -> Vec<String> {
             out.push(format!("effect {i} covers {}..{}, after {covered}", e.cmd_from, e.cmd_to));
         }
         covered = e.cmd_to;
+        covered_at.push(covered);
         for b in &e.outcomes {
             if !reported.insert((b.writer, b.batch_no)) {
                 out.push(format!("batch {} of writer {:016x} ran twice", b.batch_no, b.writer));
@@ -644,6 +700,9 @@ fn audit(cmd: &[Bytes], fx: &[Bytes]) -> Vec<String> {
     }
     let mut highest: BTreeMap<u64, u64> = BTreeMap::new();
     for (seq, b) in batches.iter().enumerate() {
+        if cmd[seq].command {
+            continue;
+        }
         let Some(b) = b else {
             out.push(format!("command {seq} doesn't decode"));
             continue;

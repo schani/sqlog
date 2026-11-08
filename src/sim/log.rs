@@ -3,7 +3,7 @@
 //! can still land.
 
 use std::collections::BTreeSet;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -136,12 +136,14 @@ impl Net {
 
 #[derive(Default)]
 pub struct Stream {
-    records: Mutex<Vec<Bytes>>,
+    /// Every record ever appended; reads skip those before `start`.
+    records: Mutex<Vec<Record>>,
+    start: AtomicU64,
     appended: Notify,
 }
 
 impl Stream {
-    pub fn records(&self) -> Vec<Bytes> {
+    pub fn records(&self) -> Vec<Record> {
         self.records.lock().unwrap().clone()
     }
 
@@ -149,7 +151,12 @@ impl Stream {
         self.records.lock().unwrap().len() as u64
     }
 
-    fn land(&self, expected: Option<u64>, body: Bytes, net: &Net) -> Result<u64, AppendError> {
+    /// The trim point.
+    pub fn start(&self) -> u64 {
+        self.start.load(Relaxed)
+    }
+
+    fn land(self: &Arc<Self>, expected: Option<u64>, body: Bytes, command: bool, net: &Net) -> Result<u64, AppendError> {
         let mut records = self.records.lock().unwrap();
         let tail = records.len() as u64;
         if net.bug != Bug::IgnoreExpected && expected.is_some_and(|e| e != tail) {
@@ -158,7 +165,17 @@ impl Stream {
         if net.bug == Bug::ForgetAcked && net.hit(0.005) {
             return Ok(tail);
         }
-        records.push(body);
+        if command {
+            // A trim takes effect a while later, never past its own record, and never backwards.
+            let point = u64::from_be_bytes(body[..8].try_into().expect("trim position")).min(tail + 1);
+            let delay = Duration::from_millis(net.rng.lock().unwrap().gen_range(0..2000));
+            let stream = self.clone();
+            tokio::spawn(async move {
+                sleep(delay).await;
+                stream.start.fetch_max(point, Relaxed);
+            });
+        }
+        records.push(Record { seq: tail, body, command });
         drop(records);
         self.appended.notify_waiters();
         Ok(tail)
@@ -179,31 +196,7 @@ fn error(what: &str) -> AppendError {
 #[async_trait]
 impl Log for SimLog {
     async fn append(&self, expected: Option<u64>, body: Bytes) -> Result<u64, AppendError> {
-        if !self.net.connected(self.node) {
-            sleep(CLIENT_TIMEOUT).await;
-            return Err(error("unreachable log"));
-        }
-        let half = self.net.latency() / 2;
-        let fate = if body.len() > MAX_RECORD_BYTES { Fate::Dropped } else { self.net.fate() };
-        let (tx, rx) = oneshot::channel();
-        let (stream, net, node) = (self.stream.clone(), self.net.clone(), self.node);
-        tokio::spawn(async move {
-            sleep(half).await;
-            let result = match fate {
-                Fate::Dropped => Err(error("dropped append")),
-                Fate::Ghost(_) => Err(error("append timeout")),
-                Fate::LostAck => stream.land(expected, body.clone(), &net).and(Err(error("lost ack"))),
-                Fate::Normal if net.connected(node) => stream.land(expected, body.clone(), &net),
-                Fate::Normal => Err(error("partition")),
-            };
-            sleep(half).await;
-            let _ = tx.send(if net.connected(node) { result } else { Err(error("lost reply")) });
-            if let Fate::Ghost(delay) = fate {
-                sleep(delay).await;
-                let _ = stream.land(expected, body, &net);
-            }
-        });
-        rx.await.unwrap_or_else(|_| Err(error("runtime shutdown")))
+        self.send(expected, body, false).await
     }
 
     async fn read(&self, from: u64, wait: Duration) -> anyhow::Result<Vec<Record>> {
@@ -221,8 +214,8 @@ impl Log for SimLog {
             notified.as_mut().enable();
             let mut batch: Vec<Record> = {
                 let records = self.stream.records.lock().unwrap();
-                let end = records.len().min(from as usize + 1000);
-                (from as usize..end).map(|i| Record { seq: i as u64, body: records[i].clone() }).collect()
+                let from = from.max(self.stream.start()) as usize;
+                records.iter().skip(from).take(1000).cloned().collect()
             };
             if !batch.is_empty() {
                 if batch.len() > 1 && self.net.hit(self.net.faults.short_read) {
@@ -237,5 +230,39 @@ impl Log for SimLog {
             }
             anyhow::ensure!(self.net.connected(self.node), "simulated partition");
         }
+    }
+
+    async fn trim(&self, seq: u64) -> anyhow::Result<()> {
+        self.send(None, Bytes::copy_from_slice(&seq.to_be_bytes()), true).await.map(|_| ()).map_err(|e| anyhow!("{e:?}"))
+    }
+}
+
+impl SimLog {
+    async fn send(&self, expected: Option<u64>, body: Bytes, command: bool) -> Result<u64, AppendError> {
+        if !self.net.connected(self.node) {
+            sleep(CLIENT_TIMEOUT).await;
+            return Err(error("unreachable log"));
+        }
+        let half = self.net.latency() / 2;
+        let fate = if body.len() > MAX_RECORD_BYTES { Fate::Dropped } else { self.net.fate() };
+        let (tx, rx) = oneshot::channel();
+        let (stream, net, node) = (self.stream.clone(), self.net.clone(), self.node);
+        tokio::spawn(async move {
+            sleep(half).await;
+            let result = match fate {
+                Fate::Dropped => Err(error("dropped append")),
+                Fate::Ghost(_) => Err(error("append timeout")),
+                Fate::LostAck => stream.land(expected, body.clone(), command, &net).and(Err(error("lost ack"))),
+                Fate::Normal if net.connected(node) => stream.land(expected, body.clone(), command, &net),
+                Fate::Normal => Err(error("partition")),
+            };
+            sleep(half).await;
+            let _ = tx.send(if net.connected(node) { result } else { Err(error("lost reply")) });
+            if let Fate::Ghost(delay) = fate {
+                sleep(delay).await;
+                let _ = stream.land(expected, body, command, &net);
+            }
+        });
+        rx.await.unwrap_or_else(|_| Err(error("runtime shutdown")))
     }
 }

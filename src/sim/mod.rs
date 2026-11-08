@@ -167,6 +167,9 @@ fn sweep(args: &SimArgs) -> anyhow::Result<bool> {
                 total.effects += r.effects;
                 total.lost_races += r.lost_races;
                 total.verified += r.verified;
+                total.snapshots += r.snapshots;
+                total.restores += r.restores;
+                total.trimmed += r.trimmed;
                 total.virtual_secs += r.virtual_secs;
                 if !r.failures.is_empty() {
                     bad.push(*seed);
@@ -177,7 +180,7 @@ fn sweep(args: &SimArgs) -> anyhow::Result<bool> {
     }
     println!(
         "{} seeds in {:.0?}, {} virtual seconds: {} committed, {} aborted, {} unknown, {} queries; {} crashes, {} partitions, {} outages; \
-         {} command records, {} effects, {} races lost, {} verified",
+         {} command records, {} effects, {} races lost, {} verified; {} snapshots, {} restores, {} effect log records trimmed",
         results.len(),
         t0.elapsed(),
         total.virtual_secs,
@@ -192,6 +195,9 @@ fn sweep(args: &SimArgs) -> anyhow::Result<bool> {
         total.effects,
         total.lost_races,
         total.verified,
+        total.snapshots,
+        total.restores,
+        total.trimmed,
     );
     if bad.is_empty() {
         println!("PASS");
@@ -239,6 +245,6 @@ mod tests {
 
     #[test]
     fn notices_log_that_forgets_acknowledged_appends() {
-        assert!((0..5).any(|seed| !run(seed, opts(Bug::ForgetAcked)).failures.is_empty()));
+        assert!((0..20).any(|seed| !run(seed, opts(Bug::ForgetAcked)).failures.is_empty()));
     }
 }

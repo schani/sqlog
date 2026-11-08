@@ -2,7 +2,6 @@
 //! producers execute them, readers apply the effects. At the end every node must hold the
 //! same database bytes, and money must be conserved.
 
-use std::sync::Arc;
 use std::sync::atomic::Ordering::Relaxed;
 use std::time::Duration;
 
@@ -11,8 +10,7 @@ use serde_json::json;
 use tokio::time::Instant;
 
 use super::model::{SqlTxn, Stmt, TxnOutcome};
-use super::node::{SqlConfig, SqlNode};
-use crate::log::Log;
+use super::node::{Logs, SqlConfig, SqlNode};
 
 pub struct SqlBenchConfig {
     pub writers: usize,
@@ -49,14 +47,15 @@ return bal - amount;
 "#;
 
 pub async fn run(
-    make_logs: impl AsyncFn() -> anyhow::Result<(Arc<dyn Log>, Arc<dyn Log>)>,
+    make_logs: impl AsyncFn() -> anyhow::Result<Logs>,
     cfg: SqlBenchConfig,
 ) -> anyhow::Result<bool> {
     let mut nodes = Vec::new();
     for (role, count, producer) in [("producer", cfg.producers, true), ("writer", cfg.writers, false), ("reader", cfg.readers, false)] {
         for _ in 0..count {
-            let (cmd, fx) = make_logs().await?;
-            nodes.push((role, SqlNode::start(cmd, fx, SqlConfig { producer, ..cfg.node.clone() })));
+            // Only producers snapshot, so readers and writers don't repeat their work.
+            let snapshot_every = if producer { cfg.node.snapshot_every } else { 0 };
+            nodes.push((role, SqlNode::start(make_logs().await?, SqlConfig { producer, snapshot_every, ..cfg.node.clone() })));
         }
     }
     // Without writer nodes, clients submit to producers, which hand out outcomes on publishing.
@@ -177,6 +176,13 @@ pub async fn run(
         n.wait_fx(target).await;
     }
     println!("all nodes at effect {target} after {:.2?}", t.elapsed());
+    // A node started now catches up from the latest snapshot, if there is one.
+    let t = Instant::now();
+    let late = SqlNode::start(make_logs().await?, SqlConfig { producer: false, snapshot_every: 0, ..cfg.node.clone() });
+    late.wait_fx(target).await;
+    let snapshots: u64 = nodes.iter().map(|(_, n)| n.stats.snapshots.load(Relaxed)).sum();
+    println!("{snapshots} snapshots written; a node started now caught up in {:.2?} ({} restores)", t.elapsed(), late.stats.restores.load(Relaxed));
+    nodes.push(("late", late));
     let digests: Vec<_> = nodes.iter().map(|(_, n)| n.digest()).collect();
     let same = digests.windows(2).all(|w| w[0] == w[1]);
     let (_, last) = nodes.last().unwrap();

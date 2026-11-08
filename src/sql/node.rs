@@ -13,7 +13,7 @@
 
 use std::cell::Cell;
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
@@ -30,7 +30,7 @@ use tokio::task::{AbortHandle, block_in_place};
 use tokio::time::{Instant, sleep, timeout_at};
 
 use super::js;
-use super::model::{self, BatchOutcome, CmdBatch, Effect, SqlTxn, TxnOutcome};
+use super::model::{self, BatchOutcome, CmdBatch, Effect, FxRecord, Manifest, SnapChunk, SqlTxn, TxnOutcome};
 use super::vfs::{self, PAGE_SIZE, PageStore};
 use crate::log::{AppendError, Log, Record};
 
@@ -44,13 +44,28 @@ pub struct SqlConfig {
     pub effect_target_bytes: usize,
     /// The node's id; random if not given.
     pub id: Option<u64>,
+    /// Write a snapshot each time effects cover this many more command records, and trim the
+    /// logs; 0 never.
+    pub snapshot_every: u64,
 }
 
 impl Default for SqlConfig {
     fn default() -> Self {
-        Self { epoch: Duration::ZERO, max_batch_bytes: 900 * 1024, producer: false, effect_target_bytes: 512 * 1024, id: None }
+        Self { epoch: Duration::ZERO, max_batch_bytes: 900 * 1024, producer: false, effect_target_bytes: 512 * 1024, id: None, snapshot_every: 0 }
     }
 }
+
+/// The logs of one database.
+#[derive(Clone)]
+pub struct Logs {
+    pub cmd: Arc<dyn Log>,
+    pub fx: Arc<dyn Log>,
+    /// Snapshot chunks. Manifests go on the effect log, so every node sees them in order.
+    pub snap: Arc<dyn Log>,
+}
+
+/// Pages per snapshot chunk: 800 KB, under the record limit even when incompressible.
+const SNAPSHOT_CHUNK_PAGES: usize = 200;
 
 /// S2's record limit; larger effects would need to spill to object storage.
 const MAX_EFFECT_BYTES: usize = 1_000_000;
@@ -101,9 +116,18 @@ pub struct SqlStats {
     pub lost_races: AtomicU64,
     pub verified: AtomicU64,
     pub diverged: AtomicU64,
+    pub snapshots: AtomicU64,
+    pub restores: AtomicU64,
 }
 
 type Outcome = (u64, TxnOutcome);
+
+/// A version's pages, to be written as a snapshot.
+struct Capture {
+    version: u64,
+    cmd_next: u64,
+    pages: Vec<vfs::Page>,
+}
 
 struct Pending {
     txn: SqlTxn,
@@ -117,6 +141,7 @@ pub struct SqlNode {
     store: Arc<PageStore>,
     cmd_log: Arc<dyn Log>,
     fx_log: Arc<dyn Log>,
+    snap_log: Arc<dyn Log>,
     config: SqlConfig,
     /// Serializes changes to the page store: applying effects and producing them.
     applier: Mutex<()>,
@@ -126,11 +151,17 @@ pub struct SqlNode {
     submit: mpsc::UnboundedSender<Pending>,
     batch_no: AtomicU64,
     tasks: StdMutex<Vec<AbortHandle>>,
+    /// The last snapshots announced on the effect log, oldest first, each newer than the one
+    /// before.
+    snapshots: StdMutex<Vec<Manifest>>,
+    /// A snapshot is being written.
+    snapshotting: AtomicBool,
+    snapshot_tx: mpsc::UnboundedSender<Capture>,
     pub stats: SqlStats,
 }
 
 impl SqlNode {
-    pub fn start(cmd_log: Arc<dyn Log>, fx_log: Arc<dyn Log>, config: SqlConfig) -> Arc<Self> {
+    pub fn start(logs: Logs, config: SqlConfig) -> Arc<Self> {
         let id = config.id.unwrap_or_else(rand::random);
         // Unique in the process even if ids repeat, as across simulated runs.
         static STORES: AtomicU64 = AtomicU64::new(0);
@@ -138,12 +169,14 @@ impl SqlNode {
         let store = PageStore::new();
         vfs::register_store(&name, store.clone());
         let (submit, rx) = mpsc::unbounded_channel();
+        let (snapshot_tx, snapshot_rx) = mpsc::unbounded_channel();
         let node = Arc::new(Self {
             id,
             name,
             store,
-            cmd_log,
-            fx_log,
+            cmd_log: logs.cmd,
+            fx_log: logs.fx,
+            snap_log: logs.snap,
             config,
             applier: Mutex::new(()),
             progress: watch::Sender::new(Progress::default()),
@@ -151,12 +184,18 @@ impl SqlNode {
             submit,
             batch_no: AtomicU64::new(0),
             tasks: Default::default(),
+            snapshots: Default::default(),
+            snapshotting: AtomicBool::new(false),
+            snapshot_tx,
             stats: SqlStats::default(),
         });
         node.spawn(node.clone().write_loop(rx));
         node.spawn(node.clone().apply_loop());
         if node.config.producer {
             node.spawn(node.clone().produce_loop());
+        }
+        if node.config.snapshot_every > 0 {
+            node.spawn(node.clone().snapshot_loop(snapshot_rx));
         }
         node
     }
@@ -307,6 +346,15 @@ impl SqlNode {
             match self.fx_log.read(self.progress().fx_next, Duration::from_secs(5)).await {
                 Ok(records) if !records.is_empty() => {
                     let _g = self.applier.lock().await;
+                    if records[0].seq > self.progress().fx_next {
+                        // What comes next was trimmed: this node just started, or fell behind.
+                        if let Err(e) = self.restore().await {
+                            tracing::warn!("restoring from a snapshot failed: {e:#}");
+                            drop(_g);
+                            sleep(Duration::from_millis(200)).await;
+                        }
+                        continue;
+                    }
                     for r in &records {
                         if r.seq == self.progress().fx_next {
                             self.apply_effect(r);
@@ -322,13 +370,23 @@ impl SqlNode {
         }
     }
 
-    /// Applies an effect record at the next position. Caller holds `applier`.
+    /// Applies an effect log record at the next position; returns it if it's an effect. Caller
+    /// holds `applier`.
     fn apply_effect(&self, r: &Record) -> Option<Effect> {
         assert_eq!(r.seq, self.store.latest(), "effects apply in order");
-        let fx = match model::decode::<Effect>(&r.body) {
-            Ok(fx) if fx.base == r.seq => fx,
-            Ok(fx) => panic!("effect at {} claims base {}", r.seq, fx.base),
-            Err(e) => panic!("undecodable effect at {}: {e:#}", r.seq),
+        let record = (!r.command).then(|| model::decode::<FxRecord>(&r.body).unwrap_or_else(|e| panic!("undecodable effect at {}: {e:#}", r.seq)));
+        let fx = match record {
+            Some(FxRecord::Effect(fx)) if fx.base == r.seq => fx,
+            Some(FxRecord::Effect(fx)) => panic!("effect at {} claims base {}", r.seq, fx.base),
+            // Trims and snapshot announcements are versions that change nothing.
+            other => {
+                self.store.install(Vec::new(), self.store.latest_size());
+                self.advanced(r.seq, self.progress().cmd_next);
+                if let Some(FxRecord::Snapshot(m)) = other {
+                    self.announced(m);
+                }
+                return None;
+            }
         };
         let pages = fx
             .pages
@@ -343,7 +401,7 @@ impl SqlNode {
 
     /// Publishes progress and hands out this node's outcomes after effect `seq` is installed.
     fn finish_effect(&self, seq: u64, fx: &Effect) {
-        self.progress.send_replace(Progress { fx_next: seq + 1, cmd_next: fx.cmd_to });
+        self.advanced(seq, fx.cmd_to);
         let mut waiters = self.waiters.lock().unwrap();
         for b in fx.outcomes.iter().filter(|b| b.writer == self.id) {
             if let Some(senders) = waiters.remove(&b.batch_no) {
@@ -352,6 +410,160 @@ impl SqlNode {
                 }
             }
         }
+    }
+
+    /// Publishes progress after effect log record `seq` is installed, and starts a snapshot if
+    /// one is due: when the commands covered cross a multiple of `snapshot_every`, so every
+    /// node picks the same versions. A snapshot's own records add one command record, its
+    /// trim, so an idle database stops taking snapshots.
+    fn advanced(&self, seq: u64, cmd_next: u64) {
+        let version = seq + 1;
+        let before = self.progress.send_replace(Progress { fx_next: version, cmd_next }).cmd_next;
+        let every = self.config.snapshot_every;
+        if every == 0 || before / every == cmd_next / every || self.newest_snapshot() >= version || self.snapshotting.swap(true, Relaxed) {
+            return;
+        }
+        let _ = self.snapshot_tx.send(Capture { version, cmd_next, pages: self.store.capture() });
+    }
+
+    // --- snapshots ---------------------------------------------------------------------
+
+    fn newest_snapshot(&self) -> u64 {
+        self.snapshots.lock().unwrap().last().map_or(0, |m| m.version)
+    }
+
+    /// Takes note of a snapshot announced on the effect log. If it's this node's and newer than
+    /// any before, trims the logs to the snapshot before it: a node that is further behind
+    /// restores the newest snapshot, and one in between still finds every record it needs.
+    /// Caller holds `applier`.
+    fn announced(&self, m: Manifest) {
+        let mut known = self.snapshots.lock().unwrap();
+        if known.last().is_some_and(|k| k.version >= m.version) {
+            return;
+        }
+        let previous = known.last().cloned();
+        known.push(m.clone());
+        if known.len() > 2 {
+            known.remove(0);
+        }
+        drop(known);
+        let Some(p) = previous.filter(|_| m.writer == self.id) else { return };
+        let (fx, cmd, snap) = (self.fx_log.clone(), self.cmd_log.clone(), self.snap_log.clone());
+        self.spawn(async move {
+            // A trim that fails is covered by the next one.
+            for (log, seq) in [(fx, Some(p.version)), (cmd, Some(p.cmd_next)), (snap, p.chunks.first().copied())] {
+                if let Some(seq) = seq
+                    && let Err(e) = log.trim(seq).await
+                {
+                    tracing::warn!("trim failed: {e:#}");
+                }
+            }
+        });
+    }
+
+    async fn snapshot_loop(self: Arc<Self>, mut rx: mpsc::UnboundedReceiver<Capture>) {
+        while let Some(c) = rx.recv().await {
+            self.write_snapshot(c).await;
+            self.snapshotting.store(false, Relaxed);
+        }
+    }
+
+    /// Writes a snapshot's chunks to the snapshot log, then announces it on the effect log.
+    /// Gives up once a snapshot as new is announced.
+    async fn write_snapshot(&self, c: Capture) {
+        let mut chunks = Vec::new();
+        for (i, group) in c.pages.chunks(SNAPSHOT_CHUNK_PAGES).enumerate() {
+            let data = group.iter().flat_map(|p| p.iter().copied()).collect();
+            let chunk = SnapChunk { version: c.version, first_pgno: (i * SNAPSHOT_CHUNK_PAGES) as u32 + 1, data };
+            let Some(seq) = self.append_snapshot(&self.snap_log, model::encode(&chunk), c.version).await else { return };
+            chunks.push(seq);
+        }
+        let m = Manifest {
+            writer: self.id,
+            version: c.version,
+            cmd_next: c.cmd_next,
+            db_pages: c.pages.len() as u32,
+            digest: vfs::digest(&c.pages),
+            chunks,
+        };
+        if self.append_snapshot(&self.fx_log, model::encode(&FxRecord::Snapshot(m)), c.version).await.is_some() {
+            self.stats.snapshots.fetch_add(1, Relaxed);
+        }
+    }
+
+    /// Appends a record of the snapshot of `version` until it lands, or a snapshot as new is
+    /// announced. A record that lands twice is harmless: a chunk nothing refers to, or an
+    /// announcement that isn't newer.
+    async fn append_snapshot(&self, log: &Arc<dyn Log>, body: Vec<u8>, version: u64) -> Option<u64> {
+        let body = Bytes::from(body);
+        while self.newest_snapshot() < version {
+            match log.append(None, body.clone()).await {
+                Ok(seq) => return Some(seq),
+                Err(e) => {
+                    tracing::warn!("writing snapshot {version}: {e:?}");
+                    sleep(Duration::from_millis(200)).await;
+                }
+            }
+        }
+        None
+    }
+
+    /// Loads the newest snapshot still complete, for a node whose next effect log record was
+    /// trimmed. Clients waiting for outcomes get errors, as the outcomes before the snapshot are
+    /// skipped. Caller holds `applier`.
+    async fn restore(&self) -> anyhow::Result<()> {
+        let mut manifests = Vec::new();
+        let (mut next, mut first) = (0, None);
+        loop {
+            let records = self.fx_log.read(next, Duration::ZERO).await?;
+            let Some(last) = records.last() else { break };
+            first.get_or_insert(records[0].seq);
+            next = last.seq + 1;
+            for r in records.iter().filter(|r| !r.command) {
+                if let Ok(FxRecord::Snapshot(m)) = model::decode(&r.body) {
+                    manifests.push(m);
+                }
+            }
+        }
+        // A snapshot older than the effect log's start can't be caught up from.
+        let floor = first.unwrap_or(0).max(self.progress().fx_next + 1);
+        manifests.retain(|m| m.version >= floor);
+        manifests.sort_by_key(|m| std::cmp::Reverse(m.version));
+        for m in manifests {
+            let Some(pages) = self.load_snapshot(&m).await? else { continue };
+            assert_eq!(vfs::digest(&pages), m.digest, "snapshot of version {} doesn't match its digest", m.version);
+            let pages = pages.into_iter().enumerate().map(|(i, p)| (i as u32 + 1, p)).collect();
+            self.store.install_at(m.version, pages, m.db_pages);
+            self.waiters.lock().unwrap().clear();
+            self.progress.send_replace(Progress { fx_next: m.version, cmd_next: m.cmd_next });
+            self.stats.restores.fetch_add(1, Relaxed);
+            *self.snapshots.lock().unwrap() = vec![m];
+            return Ok(());
+        }
+        anyhow::bail!("no complete snapshot at or after version {floor}")
+    }
+
+    /// Reads a snapshot's pages; `None` if a chunk was trimmed.
+    async fn load_snapshot(&self, m: &Manifest) -> anyhow::Result<Option<Vec<vfs::Page>>> {
+        let mut pages: Vec<vfs::Page> = Vec::with_capacity(m.db_pages as usize);
+        // Reads return the records that follow, too, which are often the next chunks.
+        let mut ahead: BTreeMap<u64, Record> = BTreeMap::new();
+        for &seq in &m.chunks {
+            let r = match ahead.remove(&seq) {
+                Some(r) => r,
+                None => {
+                    let mut records = self.snap_log.read(seq, Duration::ZERO).await?.into_iter();
+                    let Some(r) = records.next().filter(|r| r.seq == seq) else { return Ok(None) };
+                    ahead = records.map(|r| (r.seq, r)).collect();
+                    r
+                }
+            };
+            let c: SnapChunk = model::decode(&r.body).with_context(|| format!("snapshot chunk at {seq}"))?;
+            anyhow::ensure!(c.version == m.version && c.first_pgno as usize == pages.len() + 1, "chunk at {seq} doesn't belong to snapshot {}", m.version);
+            pages.extend(c.data.chunks(PAGE_SIZE).map(vfs::Page::from));
+        }
+        anyhow::ensure!(pages.len() == m.db_pages as usize, "snapshot {} has {} of {} pages", m.version, pages.len(), m.db_pages);
+        Ok(Some(pages))
     }
 
     // --- producer ----------------------------------------------------------------------
@@ -534,6 +746,7 @@ impl SqlNode {
             if records.is_empty() {
                 return Ok(());
             }
+            anyhow::ensure!(records[0].seq <= self.progress().fx_next, "effect log trimmed past {}", self.progress().fx_next);
             for r in &records {
                 if r.seq != self.progress().fx_next {
                     continue;
@@ -614,6 +827,9 @@ fn execute_record(conn: &Connection, r: &Record, fits: Option<&dyn Fn(&BatchOutc
          CREATE TABLE IF NOT EXISTS _sqlog_writers(writer INTEGER PRIMARY KEY, batch_no INTEGER NOT NULL);",
     )?;
     let result = (|| -> anyhow::Result<Executed> {
+        if r.command {
+            return Ok(Executed::Batch(None));
+        }
         let Ok(batch) = model::decode::<CmdBatch>(&r.body) else {
             tracing::warn!(seq = r.seq, "skipping undecodable command record");
             return Ok(Executed::Batch(None));
@@ -790,8 +1006,9 @@ mod tests {
     use crate::log::MemLog;
     use crate::sql::model::Stmt;
 
-    fn logs() -> (Arc<dyn Log>, Arc<dyn Log>) {
-        (Arc::new(MemLog::new(Duration::from_millis(1), 0.0)), Arc::new(MemLog::new(Duration::from_millis(1), 0.0)))
+    fn logs() -> Logs {
+        let mem = || -> Arc<dyn Log> { Arc::new(MemLog::new(Duration::from_millis(1), 0.0)) };
+        Logs { cmd: mem(), fx: mem(), snap: mem() }
     }
 
     fn txn(sql: &str) -> SqlTxn {
@@ -816,9 +1033,9 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn client_sql_cannot_touch_internal_tables() {
-        let (cmd, fx) = logs();
-        let node = SqlNode::start(cmd.clone(), fx.clone(), SqlConfig { producer: true, ..Default::default() });
-        let reader = SqlNode::start(cmd, fx, SqlConfig::default());
+        let logs = logs();
+        let node = SqlNode::start(logs.clone(), SqlConfig { producer: true, ..Default::default() });
+        let reader = SqlNode::start(logs, SqlConfig::default());
         assert!(!aborted(&run(&node, "CREATE TABLE kv(k TEXT PRIMARY KEY, v INTEGER)").await));
         for sql in [
             "UPDATE _sqlog_meta SET cmd_next = 0",
@@ -852,9 +1069,9 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn js_transactions() {
-        let (cmd, fx) = logs();
-        let node = SqlNode::start(cmd.clone(), fx.clone(), SqlConfig { producer: true, ..Default::default() });
-        let reader = SqlNode::start(cmd, fx, SqlConfig::default());
+        let logs = logs();
+        let node = SqlNode::start(logs.clone(), SqlConfig { producer: true, ..Default::default() });
+        let reader = SqlNode::start(logs, SqlConfig::default());
         assert!(!aborted(&run(&node, "CREATE TABLE kv(k TEXT PRIMARY KEY, v INTEGER)").await));
         let put = js(
             "let n = 0;\n\
@@ -891,10 +1108,10 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn oversized_transaction_aborts_alone() {
-        let (cmd, fx) = logs();
+        let logs = logs();
         let config = SqlConfig { producer: true, epoch: Duration::from_millis(50), ..Default::default() };
-        let node = SqlNode::start(cmd.clone(), fx.clone(), config);
-        let reader = SqlNode::start(cmd, fx, SqlConfig::default());
+        let node = SqlNode::start(logs.clone(), config);
+        let reader = SqlNode::start(logs, SqlConfig::default());
         assert!(!aborted(&run(&node, "CREATE TABLE b(x BLOB)").await));
         // One command record: small, too large, small.
         let sqls = ["INSERT INTO b VALUES (randomblob(1000))", "INSERT INTO b VALUES (randomblob(1500000))", "INSERT INTO b VALUES (randomblob(1000))"];
@@ -910,9 +1127,9 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn rollback_garbage_in_free_pages_does_not_halt_producers() {
-        let (cmd, fx) = logs();
-        let node = SqlNode::start(cmd.clone(), fx.clone(), SqlConfig { producer: true, ..Default::default() });
-        let reader = SqlNode::start(cmd, fx, SqlConfig::default());
+        let logs = logs();
+        let node = SqlNode::start(logs.clone(), SqlConfig { producer: true, ..Default::default() });
+        let reader = SqlNode::start(logs, SqlConfig::default());
         for sql in ["CREATE TABLE b(x BLOB)", "INSERT INTO b VALUES (randomblob(800000))", "INSERT INTO b VALUES (randomblob(800000))", "DELETE FROM b"] {
             assert!(!aborted(&run(&node, sql).await), "{sql}");
         }
@@ -927,10 +1144,10 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn rolling_back_the_frame_aborts_only_that_transaction() {
-        let (cmd, fx) = logs();
+        let logs = logs();
         let config = SqlConfig { producer: true, epoch: Duration::from_millis(50), ..Default::default() };
-        let node = SqlNode::start(cmd.clone(), fx.clone(), config);
-        let reader = SqlNode::start(cmd, fx, SqlConfig::default());
+        let node = SqlNode::start(logs.clone(), config);
+        let reader = SqlNode::start(logs, SqlConfig::default());
         for sql in [
             "CREATE TABLE u(x INTEGER PRIMARY KEY)",
             "INSERT INTO u VALUES (1)",
@@ -956,10 +1173,10 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn records_too_large_together_go_in_separate_effects() {
-        let (cmd, fx) = logs();
-        let producer = SqlNode::start(cmd.clone(), fx.clone(), SqlConfig { producer: true, effect_target_bytes: 8 << 20, ..Default::default() });
-        let w1 = SqlNode::start(cmd.clone(), fx.clone(), SqlConfig::default());
-        let w2 = SqlNode::start(cmd, fx, SqlConfig::default());
+        let logs = logs();
+        let producer = SqlNode::start(logs.clone(), SqlConfig { producer: true, effect_target_bytes: 8 << 20, ..Default::default() });
+        let w1 = SqlNode::start(logs.clone(), SqlConfig::default());
+        let w2 = SqlNode::start(logs, SqlConfig::default());
         assert!(!aborted(&run(&producer, "CREATE TABLE b(x BLOB)").await));
         let fx_before = producer.progress().fx_next;
         let sql = "INSERT INTO b VALUES (randomblob(600000))";

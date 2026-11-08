@@ -37,11 +37,14 @@ struct ReadBatch {
 struct ReadRecord {
     seq_num: u64,
     body: String,
+    #[serde(default)]
+    headers: Vec<(String, String)>,
 }
 
 impl S2Log {
-    /// Connects to `stream` in `basin`, creating the stream if it does not exist.
-    pub async fn connect(basin: &str, stream: &str, token: &str) -> anyhow::Result<Self> {
+    /// Connects to `stream` in `basin`, creating the stream if it does not exist. With
+    /// `retain_forever`, asks for records to stay until trimmed, which not every plan allows.
+    pub async fn connect(basin: &str, stream: &str, token: &str, retain_forever: bool) -> anyhow::Result<Self> {
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert("authorization", format!("Bearer {token}").parse()?);
         headers.insert("s2-format", "base64".parse()?);
@@ -54,6 +57,13 @@ impl S2Log {
         let r = http.post(format!("{base}/streams")).json(&json!({ "stream": stream })).send().await?;
         if !(r.status().is_success() || r.status() == StatusCode::CONFLICT) {
             bail!("creating stream {stream}: {} {}", r.status(), r.text().await.unwrap_or_default());
+        }
+        if retain_forever {
+            let forever = json!({ "retention_policy": { "infinite": {} } });
+            let r = http.patch(format!("{base}/streams/{stream}")).json(&forever).send().await?;
+            if !r.status().is_success() {
+                tracing::warn!("stream {stream} keeps its retention, so records expire even if not trimmed: {} {}", r.status(), r.text().await.unwrap_or_default());
+            }
         }
         Ok(Self { http, stream_url: format!("{base}/streams/{stream}") })
     }
@@ -99,11 +109,22 @@ impl Log for S2Log {
                 batch
                     .records
                     .into_iter()
-                    .map(|rec| Ok(Record { seq: rec.seq_num, body: B64.decode(rec.body).context("record body")?.into() }))
+                    .map(|rec| {
+                        // A command record has exactly one header, with an empty name.
+                        let command = matches!(rec.headers.as_slice(), [(name, _)] if name.is_empty());
+                        Ok(Record { seq: rec.seq_num, body: B64.decode(rec.body).context("record body")?.into(), command })
+                    })
                     .collect()
             }
             StatusCode::RANGE_NOT_SATISFIABLE => Ok(Vec::new()),
             s => bail!("read: {s} {}", r.text().await.unwrap_or_default()),
         }
+    }
+
+    async fn trim(&self, seq: u64) -> anyhow::Result<()> {
+        let record = json!({ "headers": [["", B64.encode("trim")]], "body": B64.encode(seq.to_be_bytes()) });
+        let r = self.http.post(format!("{}/records", self.stream_url)).json(&json!({ "records": [record] })).send().await?;
+        anyhow::ensure!(r.status().is_success(), "trim: {} {}", r.status(), r.text().await.unwrap_or_default());
+        Ok(())
     }
 }

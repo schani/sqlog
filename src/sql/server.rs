@@ -57,5 +57,7 @@ async fn status(State(node): State<Arc<SqlNode>>) -> Json<Json_> {
         "effect_races_lost": s.lost_races.load(Relaxed),
         "verified": s.verified.load(Relaxed),
         "diverged": s.diverged.load(Relaxed),
+        "snapshots_written": s.snapshots.load(Relaxed),
+        "restores": s.restores.load(Relaxed),
     }))
 }

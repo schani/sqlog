@@ -76,6 +76,9 @@ enum Cmd {
         producer: bool,
         #[arg(long, default_value_t = 0)]
         epoch_ms: u64,
+        /// Write a snapshot every this many command records, and trim the logs; 0 never.
+        #[arg(long, default_value_t = 0)]
+        snapshot_every: u64,
         #[arg(long, default_value = "127.0.0.1:7000")]
         listen: String,
     },
@@ -100,6 +103,9 @@ enum Cmd {
         /// Run transfers as JavaScript transactions.
         #[arg(long)]
         js: bool,
+        /// Producers write a snapshot every this many command records, and trim the logs; 0 never.
+        #[arg(long, default_value_t = 0)]
+        snapshot_every: u64,
     },
     /// Deterministic simulation: seeded faults, then a serializability check of what clients saw.
     Sim(sim::SimArgs),
@@ -169,33 +175,36 @@ impl LogArgs {
                 LogKind::S2 => {
                     let basin = basin.as_deref().context("--basin or S2_BASIN required")?;
                     let key = key.as_deref().context("S2_API_KEY required")?;
-                    Arc::new(s2::S2Log::connect(basin, &stream, key).await?)
+                    Arc::new(s2::S2Log::connect(basin, &stream, key, false).await?)
                 }
             })
         }
     }
 
-    /// Like `factory`, for the SQL node's command and effect logs.
-    fn sql_factory(&self) -> impl AsyncFn() -> anyhow::Result<(Arc<dyn Log>, Arc<dyn Log>)> {
+    /// Like `factory`, for the SQL node's command, effect and snapshot logs, which keep their
+    /// records until trimmed if `retain_forever`.
+    fn sql_factory(&self, retain_forever: bool) -> impl AsyncFn() -> anyhow::Result<sql::node::Logs> {
         let kind = self.log;
         let latency = Duration::from_millis(self.mem_latency_ms);
-        let mem: (Arc<dyn Log>, Arc<dyn Log>) =
-            (Arc::new(MemLog::new(latency, self.mem_lost_acks)), Arc::new(MemLog::new(latency, self.mem_lost_acks)));
+        let mem = || -> Arc<dyn Log> { Arc::new(MemLog::new(latency, self.mem_lost_acks)) };
+        let mem = sql::node::Logs { cmd: mem(), fx: mem(), snap: mem() };
         let stream = self.stream_name();
         let basin = self.basin.clone();
         let key = self.s2_key.clone();
         if matches!(kind, LogKind::S2) {
-            println!("logs: s2 basin {} streams {stream}-cmd, {stream}-fx", basin.as_deref().unwrap_or("?"));
+            println!("logs: s2 basin {} streams {stream}-cmd, {stream}-fx, {stream}-snap", basin.as_deref().unwrap_or("?"));
         }
-        async move || -> anyhow::Result<(Arc<dyn Log>, Arc<dyn Log>)> {
+        async move || -> anyhow::Result<sql::node::Logs> {
             Ok(match kind {
                 LogKind::Mem => mem.clone(),
                 LogKind::S2 => {
                     let basin = basin.as_deref().context("--basin or S2_BASIN required")?;
                     let key = key.as_deref().context("S2_API_KEY required")?;
-                    let cmd: Arc<dyn Log> = Arc::new(s2::S2Log::connect(basin, &format!("{stream}-cmd"), key).await?);
-                    let fx: Arc<dyn Log> = Arc::new(s2::S2Log::connect(basin, &format!("{stream}-fx"), key).await?);
-                    (cmd, fx)
+                    let connect = async |suffix: &str| -> anyhow::Result<Arc<dyn Log>> {
+                        let log: Arc<dyn Log> = Arc::new(s2::S2Log::connect(basin, &format!("{stream}-{suffix}"), key, retain_forever).await?);
+                        Ok(log)
+                    };
+                    sql::node::Logs { cmd: connect("cmd").await?, fx: connect("fx").await?, snap: connect("snap").await? }
                 }
             })
         }
@@ -260,15 +269,15 @@ async fn main() -> anyhow::Result<()> {
                 std::process::exit(1);
             }
         }
-        Cmd::SqlServe { log, producer, epoch_ms, listen } => {
-            let (cmd, fx) = log.sql_factory()().await?;
-            let config = sql::node::SqlConfig { producer, epoch: Duration::from_millis(epoch_ms), ..Default::default() };
-            let node = sql::node::SqlNode::start(cmd, fx, config);
+        Cmd::SqlServe { log, producer, epoch_ms, snapshot_every, listen } => {
+            let logs = log.sql_factory(true)().await?;
+            let config = sql::node::SqlConfig { producer, epoch: Duration::from_millis(epoch_ms), snapshot_every, ..Default::default() };
+            let node = sql::node::SqlNode::start(logs, config);
             let listener = tokio::net::TcpListener::bind(&listen).await?;
             println!("sql node {:016x} listening on {listen}", node.id);
             axum::serve(listener, sql::server::router(node)).await?;
         }
-        Cmd::SqlBench { log, epoch_ms, writers, producers, readers, clients, accounts, seconds, js } => {
+        Cmd::SqlBench { log, epoch_ms, writers, producers, readers, clients, accounts, seconds, js, snapshot_every } => {
             let cfg = sql::bench::SqlBenchConfig {
                 writers,
                 producers,
@@ -277,9 +286,9 @@ async fn main() -> anyhow::Result<()> {
                 accounts,
                 duration: Duration::from_secs(seconds),
                 js,
-                node: sql::node::SqlConfig { epoch: Duration::from_millis(epoch_ms), ..Default::default() },
+                node: sql::node::SqlConfig { epoch: Duration::from_millis(epoch_ms), snapshot_every, ..Default::default() },
             };
-            if !sql::bench::run(log.sql_factory(), cfg).await? {
+            if !sql::bench::run(log.sql_factory(false), cfg).await? {
                 std::process::exit(1);
             }
         }

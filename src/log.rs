@@ -12,6 +12,8 @@ use tokio::time::{Instant, sleep, timeout_at};
 pub struct Record {
     pub seq: u64,
     pub body: Bytes,
+    /// A marker the log itself wrote, such as a trim; carries no data.
+    pub command: bool,
 }
 
 #[derive(Debug)]
@@ -29,13 +31,18 @@ pub trait Log: Send + Sync + 'static {
     async fn append(&self, expected: Option<u64>, body: Bytes) -> Result<u64, AppendError>;
 
     /// Reads records from `from` on. At the tail, waits up to `wait` for new records,
-    /// returning an empty batch if none arrive.
+    /// returning an empty batch if none arrive. Records before the trim point are skipped, so
+    /// the first record returned can be after `from`.
     async fn read(&self, from: u64, wait: Duration) -> anyhow::Result<Vec<Record>>;
+
+    /// Removes the records before `seq`, eventually, by appending a command record.
+    async fn trim(&self, seq: u64) -> anyhow::Result<()>;
 }
 
 /// In-process log with simulated round-trip latency and lost acknowledgements.
 pub struct MemLog {
-    records: Mutex<Vec<Bytes>>,
+    /// Records, and the trim point.
+    records: Mutex<(Vec<Record>, u64)>,
     appended: Notify,
     latency: Duration,
     /// Probability that a successful append reports an error anyway.
@@ -44,19 +51,16 @@ pub struct MemLog {
 
 impl MemLog {
     pub fn new(latency: Duration, lost_ack: f64) -> Self {
-        Self { records: Mutex::new(Vec::new()), appended: Notify::new(), latency, lost_ack }
+        Self { records: Mutex::new((Vec::new(), 0)), appended: Notify::new(), latency, lost_ack }
     }
-}
 
-#[async_trait]
-impl Log for MemLog {
-    async fn append(&self, expected: Option<u64>, body: Bytes) -> Result<u64, AppendError> {
+    async fn land(&self, expected: Option<u64>, body: Bytes, command: bool) -> Result<u64, AppendError> {
         sleep(self.latency / 2).await;
         let result = {
-            let mut records = self.records.lock().unwrap();
+            let (records, _) = &mut *self.records.lock().unwrap();
             let tail = records.len() as u64;
             if expected.is_none_or(|e| e == tail) {
-                records.push(body);
+                records.push(Record { seq: tail, body, command });
                 Ok(tail)
             } else {
                 Err(AppendError::Mismatch { tail })
@@ -69,6 +73,13 @@ impl Log for MemLog {
         }
         result
     }
+}
+
+#[async_trait]
+impl Log for MemLog {
+    async fn append(&self, expected: Option<u64>, body: Bytes) -> Result<u64, AppendError> {
+        self.land(expected, body, false).await
+    }
 
     async fn read(&self, from: u64, wait: Duration) -> anyhow::Result<Vec<Record>> {
         let deadline = Instant::now() + wait;
@@ -78,9 +89,9 @@ impl Log for MemLog {
             tokio::pin!(notified);
             notified.as_mut().enable();
             let batch: Vec<Record> = {
-                let records = self.records.lock().unwrap();
-                let end = records.len().min(from as usize + 1000);
-                (from as usize..end).map(|i| Record { seq: i as u64, body: records[i].clone() }).collect()
+                let (records, start) = &*self.records.lock().unwrap();
+                let from = from.max(*start) as usize;
+                records.iter().skip(from).take(1000).cloned().collect()
             };
             if !batch.is_empty() {
                 sleep(self.latency / 2).await;
@@ -91,4 +102,12 @@ impl Log for MemLog {
             }
         }
     }
+
+    async fn trim(&self, seq: u64) -> anyhow::Result<()> {
+        let at = self.land(None, Bytes::new(), true).await.map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        let mut records = self.records.lock().unwrap();
+        records.1 = records.1.max(seq.min(at + 1));
+        Ok(())
+    }
 }
+

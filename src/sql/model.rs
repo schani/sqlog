@@ -85,6 +85,38 @@ pub struct Effect {
     pub digest: u64,
 }
 
+/// A record of the effect log other than a trim.
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum FxRecord {
+    Effect(Effect),
+    /// Announces a snapshot; changes nothing in the database.
+    Snapshot(Manifest),
+}
+
+/// The database at `version`, in chunks on the snapshot log.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct Manifest {
+    pub writer: u64,
+    pub version: u64,
+    /// Command records covered at `version`.
+    pub cmd_next: u64,
+    pub db_pages: u32,
+    /// The page store's digest at `version`.
+    pub digest: u64,
+    /// The chunks' positions on the snapshot log, in page order.
+    pub chunks: Vec<u64>,
+}
+
+/// Consecutive pages of a snapshot, from `first_pgno` on.
+#[derive(Serialize, Deserialize)]
+pub struct SnapChunk {
+    pub version: u64,
+    pub first_pgno: u32,
+    #[serde(with = "serde_bytes")]
+    pub data: Vec<u8>,
+}
+
 pub fn encode<T: Serialize>(value: &T) -> Vec<u8> {
     let raw = rmp_serde::to_vec_named(value).expect("record encodes");
     zstd::encode_all(raw.as_slice(), 3).expect("zstd")

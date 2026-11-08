@@ -106,7 +106,7 @@ All 48 runs (S2 and in-memory): every node identical, money conserved. With 10% 
 
 ## SQL mode: SQLite over a command log and an effect log
 
-`src/sql/`. Two S2 streams per database: `<stream>-cmd` and `<stream>-fx`.
+`src/sql/`. Three S2 streams per database: `<stream>-cmd`, `<stream>-fx` and `<stream>-snap`. `sql-serve` asks S2 to keep records until trimmed; the free tier refuses (retention is capped at 28 days), so there an idle database's records still expire.
 
 - **Writers** append SQL transactions to the command log, unconditionally, and report the position. They keep no state.
 - **Producers** execute command records on SQLite and append the changed pages plus every transaction's outcome to the effect log, conditionally at the next effect position. With several producers the first append wins; losers discard their work, apply the winner's effect and, when it covers the same commands, compare digests.
@@ -120,11 +120,12 @@ Details:
 - **JavaScript transactions** (`js.rs`): instead of statements, a transaction can be JavaScript run on QuickJS as a function body with `args` and `db` in scope. `db.query(sql, params)` returns rows as objects, `db.exec(sql, params)` the number of rows changed; the return value, as JSON, is the transaction's result, and a throw aborts it. Each thread keeps one context, frozen after setup so transactions can't leave state behind; promise jobs run before the transaction ends. Memory, stack and operation limits abort runaway code.
 - **Dedup and progress live in the database:** `_sqlog_writers` holds each writer's last batch number, `_sqlog_meta` the next command position. Both change in the same transaction as the commands, so they travel with the pages.
 - **Effects:** each page is stored in full or as XOR against its previous version, whichever leaves fewer non-zero bytes; the whole record is MessagePack compressed with zstd. Commands are compressed the same way. An effect stops taking command records at ~512 KB encoded. An effect over 1 MB (S2's record limit) is redone on half as many command records; a single record still over the limit is redone admitting its transactions one at a time, and those that don't fit abort. Each such abort restarts the record from a clean state without that transaction, because rolling back leaves its data in reused free pages, which SQLite doesn't journal. The same restart handles a statement that rolls back the whole SQLite transaction (`INSERT OR ROLLBACK`, `RAISE(ROLLBACK)`). Effects don't spill to object storage yet.
+- **Snapshots and trimming:** with `--snapshot-every N`, a node snapshots each time effects cover N more command records; every node picks the same versions, so whichever announces first wins and the others stop. Snapshots are full copies of the pages, written in chunks of 200 pages to the snapshot log, then announced with a manifest on the effect log, so every node sees them in order. When a node sees its own snapshot announced, it trims the effect and command logs to the snapshot before, and the snapshot log to that snapshot's first chunk. A node whose next effect was trimmed (it just started, or fell behind) loads the newest complete snapshot and goes on from there; clients waiting on it for outcomes get errors. S2 trims by appending a command record, so trims and announcements are versions that change nothing, keeping version and effect position equal.
 
 ```bash
 ./target/release/sqlog sql-bench                                    # in-memory logs
 ./target/release/sqlog sql-bench --log s2 --basin logdb-bench-976641 --clients 2000 --writers 3 --producers 2 --readers 2
-./target/release/sqlog sql-serve --log s2 --basin logdb-bench-976641 --stream demo --producer --listen 127.0.0.1:7000
+./target/release/sqlog sql-serve --log s2 --basin logdb-bench-976641 --stream demo --producer --snapshot-every 1000 --listen 127.0.0.1:7000
 ./target/release/sqlog sql-serve --log s2 --basin logdb-bench-976641 --stream demo --listen 127.0.0.1:7001
 curl -XPOST localhost:7001/txn -H 'content-type: application/json' \
   -d '{"stmts":[{"sql":"CREATE TABLE kv(k TEXT PRIMARY KEY, v INTEGER)"}]}'
@@ -165,13 +166,13 @@ All runs pass. S2 appends took 60–90 ms during these runs (laptop), about twic
 ./target/release/sqlog sim --seed 1350 --secs 30 --history h.json   # replay one
 ```
 
-- **Faults:** dropped appends, lost acks, appends that report failure and land up to 5 s later, read errors, short and empty reads, latency spikes, 1 MB record limit, node crashes (including all at once), node partitions and log outages. Rates and cluster shape come from the seed.
+- **Faults:** dropped appends, lost acks, appends that report failure and land up to 5 s later, read errors, short and empty reads, latency spikes, 1 MB record limit, trims that take effect up to 2 s late, node crashes (including all at once), node partitions and log outages. Rates, cluster shape and snapshot interval come from the seed.
 - **Workload:** list-append transactions in JavaScript and SQL, planned aborts, DDL, transactions that go over the effect limit, SQL that attacks the transaction frame, and queries at three consistency levels.
-- **Checks:** an Elle-style black-box checker (`checker.rs`) infers dependencies from what clients read and looks for G0, G1a, G1b, G1c, G-single, G2 and real-time cycles, lost writes, and partial effects of transactions with unknown outcomes. Read-write transactions must be strictly serializable. After faults stop, nodes must converge to identical bytes, no operation may be stuck, and an audit of both logs must show every batch ran at most once.
+- **Checks:** an Elle-style black-box checker (`checker.rs`) infers dependencies from what clients read and looks for G0, G1a, G1b, G1c, G-single, G2 and real-time cycles, lost writes, and partial effects of transactions with unknown outcomes. Read-write transactions must be strictly serializable. After faults stop, nodes must converge to identical bytes, a node started then must catch up from the trimmed logs, no operation may be stuck, and an audit of both logs must show every batch ran at most once and every snapshot covers what its effects did.
 
-Latest sweep: 3,000 seeds of 30 virtual seconds in 342 s, with 1.13M commits, 128k aborts, 49k unknown outcomes, 443k queries, 30.6k crashes, 10.8k partitions and 4.5k outages; all pass. 300 seeds run twice gave identical traces.
+Latest sweep: 3,000 seeds of 30 virtual seconds in 303 s, with 930k commits, 105k aborts, 68k unknown outcomes, 376k queries, 30.6k crashes, 10.7k partitions, 4.4k outages, 106k snapshots, 24k restores and 550k effect log records trimmed; all pass. 300 seeds run twice gave identical traces.
 
-Planted bugs, 60 seeds each:
+Planted bugs, 60 seeds each (snapshot bugs with the current shape draws, the others before snapshots existed):
 
 | Bug | Seeds failing | Detected as |
 |---|---|---|
@@ -183,6 +184,13 @@ Planted bugs, 60 seeds each:
 | Snapshots read pending pages | 7 | real-time cycles |
 | Rollback garbage kept in effects | 1 | producers stuck (run hangs) |
 | Frame loss ignored | 57 | no convergence, lost writes |
+| Restore keeps clients waiting for skipped outcomes | 6 | operations stuck |
+| Gap after a trim ignored | 47 | no convergence, late node stuck |
+| Snapshot's command position off by one | 47 | audit |
+| Snapshot labeled one version late | 47 | audit, garbage reads, lost writes |
+| Effects trimmed past the newest snapshot | 47 | late node stuck, lost writes |
+
+The 13 seeds that miss each snapshot bug take no snapshots.
 
 Not reloading the executor after others' effects goes unnoticed, correctly: SQLite resets its cache when page 1's change counter differs, so the reopen in `produce` is only defensive.
 
@@ -191,7 +199,7 @@ Limits: tasks never run in parallel, so thread races between queries and the app
 ## Not yet
 
 - Pipelined appends (S2 append sessions); currently one append in flight per node.
-- Checkpoints: nodes replay the whole log on start.
+- Incremental snapshots: each snapshot copies the whole database.
 - SQL mode: spilling effects over 1 MB to object storage; lazy page fetch in the VFS.
 - S3 Express backend.
 - Runs from EC2 in-region.
