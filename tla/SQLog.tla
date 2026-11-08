@@ -7,9 +7,10 @@
    batches its commands added, as a page delta carries what changed: a node applies it to
    whatever it holds, so a node holding the wrong state would stay wrong.
 
-   Logs are never shortened here; a trim moves the log's start, and reads see only records
-   from the start on. Records keep their 0-based sequence numbers: record s is log[s+1]. *)
-EXTENDS Naturals, Sequences, FiniteSets
+   Logs are never shortened here; a trim moves the log's start, and as on S2, a read from
+   before the start returns the records from the start on. Invariants see the whole history.
+   Records keep their 0-based sequence numbers: record s is log[s+1]. *)
+EXTENDS Naturals, Sequences, FiniteSets, TLC
 
 CONSTANTS
     Nodes,          \* every node applies the effect log and may snapshot
@@ -35,6 +36,9 @@ vars == <<cmd, fx, snap, cmdStart, fxStart, snapStart, trims, node, wnext, infli
 Rec(log, s) == log[s + 1]
 Max(a, b) == IF a > b THEN a ELSE b
 Min(a, b) == IF a < b THEN a ELSE b
+
+\* The first record a read from s returns, on a log starting at `start`.
+First(start, s) == Max(start, s)
 
 NoCapture == [phase |-> "none", version |-> 0, cmdNext |-> 0, db |-> <<>>, chunk |-> 0]
 Fresh == [version |-> 0, db |-> <<>>, cmdNext |-> 0, known |-> <<>>, capture |-> NoCapture, toTrim |-> {}]
@@ -97,13 +101,15 @@ LateLand(a) ==
    the effect log's tail is still the version they executed on. *)
 
 Produce(n) ==
-    LET s == node[n] IN
+    LET s == node[n]
+        from == First(cmdStart, s.cmdNext)
+    IN
     /\ Len(fx) < MaxFx
     /\ Len(fx) = s.version
-    /\ s.cmdNext >= cmdStart
-    /\ \E to \in s.cmdNext + 1 .. Len(cmd) :
-        LET db == ExecRange(s.db, s.cmdNext, to) IN
-        fx' = Append(fx, [kind |-> "effect", base |-> s.version, from |-> s.cmdNext, to |-> to,
+    /\ from = s.cmdNext \* otherwise the next commands were trimmed
+    /\ \E to \in from + 1 .. Len(cmd) :
+        LET db == ExecRange(s.db, from, to) IN
+        fx' = Append(fx, [kind |-> "effect", base |-> s.version, from |-> from, to |-> to,
                           delta |-> SubSeq(db, Len(s.db) + 1, Len(db))])
     /\ UNCHANGED <<cmd, snap, cmdStart, fxStart, snapStart, trims, node, wnext, inflight, crashes>>
 
@@ -126,11 +132,12 @@ Announce(n, s, m) ==
 
 Apply(n) ==
     LET s == node[n]
-        r == Rec(fx, s.version)
-        s1 == [s EXCEPT !.version = @ + 1]
+        i == First(fxStart, s.version)
+        r == Rec(fx, i)
+        s1 == [s EXCEPT !.version = i + 1]
     IN
-    /\ s.version < Len(fx)
-    /\ s.version >= fxStart
+    /\ i < Len(fx)
+    /\ i = s.version \* otherwise the next record was trimmed: restore
     /\ node' = [node EXCEPT ![n] =
                   CASE r.kind = "effect" -> [s1 EXCEPT !.db = s.db \o r.delta, !.cmdNext = r.to]
                     [] r.kind = "manifest" -> Announce(n, s1, r)
@@ -200,7 +207,7 @@ Restorable(s) ==
     {Rec(fx, i) : i \in {j \in fxStart .. Len(fx) - 1 :
         /\ Rec(fx, j).kind = "manifest"
         /\ Rec(fx, j).version >= Max(fxStart, s.version + 1)
-        /\ Rec(fx, j).chunk >= snapStart}}
+        /\ First(snapStart, Rec(fx, j).chunk) = Rec(fx, j).chunk}}
 
 Restore(n) ==
     LET s == node[n] IN
@@ -208,7 +215,7 @@ Restore(n) ==
     /\ fxStart < Len(fx)
     /\ \E m \in Restorable(s) :
         /\ \A o \in Restorable(s) : o.version <= m.version
-        /\ node' = [node EXCEPT ![n] = [s EXCEPT !.version = m.version, !.db = Rec(snap, m.chunk).db,
+        /\ node' = [node EXCEPT ![n] = [s EXCEPT !.version = m.version, !.db = Rec(snap, First(snapStart, m.chunk)).db,
                                                  !.cmdNext = m.cmdNext, !.known = <<m>>]]
     /\ UNCHANGED <<cmd, fx, snap, cmdStart, fxStart, snapStart, trims, wnext, inflight, crashes>>
 
@@ -276,5 +283,16 @@ Recoverable ==
 \* A producer at the tail finds the commands it has to execute next.
 CommandsRetained ==
     \A n \in Producers : node[n].version = Len(fx) => node[n].cmdNext >= cmdStart
+
+\* A node holding the snapshot before the newest can catch up from the log: only nodes
+\* further behind restore.
+OnlyLaggardsRestore ==
+    LET V == {Rec(fx, i).version : i \in {j \in 0 .. Len(fx) - 1 : Rec(fx, j).kind = "manifest"}}
+    IN fxStart = 0 \/ \E a, b \in V : a < b /\ fxStart <= a
+
+\* A restore leaves the node where it can continue from the log.
+RestoresProgress == [][\A n \in Nodes : Restore(n) => node'[n].version >= fxStart]_vars
+
+NodeSymmetry == Permutations(Nodes)
 
 =============================================================================

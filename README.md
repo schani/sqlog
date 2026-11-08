@@ -199,25 +199,48 @@ Limits: tasks never run in parallel, so thread races between queries and the app
 
 ## Model
 
-`tla/SQLog.tla` is a TLA+ spec of the log protocol: writers whose appends may land late or twice, producers racing conditional appends, nodes applying the effect log, snapshots written to the snapshot log and announced on the effect log, trims that take effect late, restores, and crashes. The database is the sequence of batches executed, and an effect carries the batches it adds, as a page delta does, so a node holding the wrong state stays wrong. Invariants:
+`tla/SQLog.tla` is a TLA+ spec of the log protocol: writers whose appends may land late or twice, producers racing conditional appends, nodes applying the effect log, snapshots written to the snapshot log and announced on the effect log, trims that take effect late, restores, and crashes. The database is the sequence of batches executed, and an effect carries the batches it adds, as a page delta does, so a node holding the wrong state stays wrong. A read from before a log's start returns the records from the start on, as on S2, so a node that misses a gap reads the wrong record. Invariants:
 
 - every effect follows the one before it and holds what executing its commands adds, so each batch runs at most once, in command log order;
 - every node holds the state its version names;
 - every snapshot holds the state, and covers the commands, of its version;
 - a node starting now can catch up, from the effect log or from a complete snapshot;
-- a producer at the tail finds the commands it has to execute next.
+- a producer at the tail finds the commands it has to execute next;
+- a node holding the snapshot before the newest catches up from the log: only nodes further behind restore;
+- a restore leaves the node where it can continue from the log.
 
 ```bash
-java -cp tla2tools.jar tlc2.TLC -workers auto -config SQLogSmall.cfg SQLog.tla       # exhaustive, 2 nodes
-java -cp tla2tools.jar tlc2.TLC -simulate num=2000000 -depth 80 -config SQLogSim.cfg SQLog.tla  # random, 3 nodes, crashes
+java -cp tla2tools.jar tlc2.TLC -workers auto -config SQLogRace.cfg SQLog.tla        # exhaustive, 2 producers, no snapshots
+java -cp tla2tools.jar tlc2.TLC -workers auto -config SQLogSmall.cfg SQLog.tla       # exhaustive, 2 nodes, snapshots
+java -cp tla2tools.jar tlc2.TLC -simulate -depth 80 -config SQLogSim.cfg SQLog.tla   # random, 3 nodes, 2 producers, crashes
 java -cp tla2tools.jar tlc2.TLC -config Witness-chunk.cfg SQLogWitness.tla           # the counterexample below
+python3 mutate.py SQLog.tla mutants                                                  # planted bugs, to check like SQLog.tla
 ```
 
-The model found a bug the simulation hadn't. Trimming the snapshot log to the previous snapshot's first chunk assumed chunks land in version order. They don't: in `SQLogWitness.tla`, three nodes snapshot versions 1, 2 and 3, and version 1's chunk lands last. Two announcements later, the snapshot log is trimmed past the chunks of versions 2 and 3 and the effect log to version 2, so a node starting then finds no snapshot to restore, and on an idle database never will. The snapshot log is now trimmed no further than the first chunk of the trimmed-to version or later (`SnapTrim = "version"`), which only drops chunks no restore can use, whatever any node believes the newest snapshot is.
+Writing the model exposed a bug the simulation hadn't found; TLC's search doesn't reach it either, as it takes three nodes and 32 steps. Trimming the snapshot log to the previous snapshot's first chunk assumed chunks land in version order. They don't: in `SQLogWitness.tla`, three nodes snapshot versions 1, 2 and 3, and version 1's chunk lands last. Two announcements later, the snapshot log is trimmed past the chunks of versions 2 and 3 and the effect log to version 2, so a node starting then finds no snapshot to restore, and on an idle database never will. The snapshot log is now trimmed no further than the first chunk of the trimmed-to version or later (`SnapTrim = "version"`), which only drops chunks no restore can use, whatever any node believes the newest snapshot is.
 
-With that rule, the exhaustive check covers 302M distinct states (2 nodes, 2 batches, 1 crash, up to 5 effect records) in 1 h 45 min, and 3.4M random traces of up to 80 steps (3 nodes, 2 crashes, up to 12 effect records) find nothing; the witness runs to its end with every invariant holding. Under the old rule (`Witness-chunk.cfg`) it violates `Recoverable`.
+With that rule, nothing is violated: the race check covers 430k distinct states (3 batches, 1 crash, up to 5 effect records), the snapshot check 302M (1 producer, 2 batches, 1 crash, up to 5 effect records; before `OnlyLaggardsRestore` and `RestoresProgress` were added), and 263k random traces of up to 80 steps (2 crashes, up to 12 effect records) find nothing; the witness runs to its end. Under the old rule (`Witness-chunk.cfg`) it violates `Recoverable`.
 
-Limits: one chunk per snapshot; no lost or duplicated trim, chunk or manifest appends beyond trims failing; logs bounded to a dozen records.
+Of the 12 bugs `mutate.py` plants, the checks catch 9 within 2 minutes of simulation (the race check catches both race bugs in a minute):
+
+| Planted bug | Caught by |
+|---|---|
+| Effect appended unconditionally | `EffectsCorrect` |
+| Batch run twice | `ExactlyOnce` |
+| Node applies the record after a trimmed one | `NodesCorrect` |
+| Restore takes an old snapshot | `RestoresProgress` |
+| Restore off by one command | `NodesCorrect` |
+| Snapshot labelled one version late | `SnapshotsCorrect` |
+| Command log trimmed one too far | `CommandsRetained` |
+| Effect log trimmed one too far | `OnlyLaggardsRestore` |
+| Logs trimmed to the newest snapshot | `OnlyLaggardsRestore` |
+| Producer executes past trimmed commands | not caught |
+| Restore loads a trimmed chunk | not caught |
+| Restore ignores the effect log's start | not caught |
+
+The last three drop checks that never fire: a producer at the tail always finds its commands, and the newest restorable snapshot always has its chunk and is new enough.
+
+Limits: one chunk per snapshot, which makes `Recoverable` follow from the trim rule, so only the witness exercises it; the snapshot check has room for only two command records, so duplicate batches meet command trims only in random traces; no liveness beyond `RestoresProgress`; effect appends always learn their outcome; no lost or duplicated trim, chunk or manifest appends beyond trims failing; logs bounded to a dozen records.
 
 ## Not yet
 
