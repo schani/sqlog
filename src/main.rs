@@ -3,6 +3,7 @@ mod bench_distributed;
 mod log;
 mod node;
 mod s2;
+mod s3log;
 mod server;
 mod sim;
 mod sql;
@@ -109,6 +110,8 @@ enum Cmd {
     },
     /// Deterministic simulation: seeded faults, then a serializability check of what clients saw.
     Sim(sim::SimArgs),
+    /// The S3 object log under a counter workload, then checks of its effects.
+    S3logBench(s3log::bench::BenchArgs),
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -295,6 +298,11 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Sim(args) => {
             // Simulation runs on its own runtime, which can't start from inside this one.
             if !std::thread::spawn(move || sim::main(args)).join().expect("simulation thread")? {
+                std::process::exit(1);
+            }
+        }
+        Cmd::S3logBench(args) => {
+            if !s3log::bench::main(args).await? {
                 std::process::exit(1);
             }
         }

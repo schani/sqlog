@@ -11,6 +11,8 @@ base64 = "0.22"
 bytes = "1"
 clap = { version = "4", features = ["derive", "env"] }
 dotenvy = "0.15"
+futures = "0.3"
+object_store = { version = "0.14", features = ["aws"] }
 rand = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "http2"] }
 rmp-serde = "1"
@@ -22,6 +24,7 @@ serde_json = "1"
 tokio = { version = "1", features = ["full", "test-util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1.29", features = ["v7"] }
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 zstd = "0.14.3"
 
