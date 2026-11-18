@@ -288,6 +288,8 @@ pub async fn run(log: S3Log, cfg: BenchConfig) -> anyhow::Result<bool> {
         let phases: Vec<_> = PHASES.iter().zip(&p.stats.phase_us).map(|(n, us)| format!("{n} {:.0}", us.load(Relaxed) as f64 / cycles / 1e3)).collect();
         println!("    ms per cycle ({cycles} cycles): {}", phases.join(", "));
     }
+    let reqs: Vec<_> = log.requests.lock().unwrap().iter().map(|(k, n)| format!("{k} {:.2}", *n as f64 / txns.max(1) as f64)).collect();
+    println!("requests per effected command: {}", reqs.join(", "));
     println!("latency ms submit->ack:    {}", percentiles(&mut ack_ms));
     println!("latency ms submit->result: {}", percentiles(&mut done_ms));
     if let Some(path) = &cfg.output {

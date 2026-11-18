@@ -136,6 +136,8 @@ pub struct S3Log {
     store: Arc<dyn ObjectStore>,
     prefix: String,
     pub config: Config,
+    /// Requests made, by kind, e.g. "GET fx".
+    pub requests: Arc<Mutex<BTreeMap<String, u64>>>,
 }
 
 /// The watermark as read, with the version to compare-and-set against; None if absent.
@@ -143,7 +145,12 @@ pub type Watermark = (String, Option<UpdateVersion>);
 
 impl S3Log {
     pub fn new(store: Arc<dyn ObjectStore>, prefix: &str, config: Config) -> Self {
-        Self { store, prefix: prefix.to_string(), config }
+        Self { store, prefix: prefix.to_string(), config, requests: Default::default() }
+    }
+
+    fn count(&self, op: &str, key: &str) {
+        let kind = key.split('/').next().unwrap_or(key);
+        *self.requests.lock().unwrap().entry(format!("{op} {kind}")).or_default() += 1;
     }
 
     fn path(&self, key: &str) -> Path {
@@ -151,6 +158,7 @@ impl S3Log {
     }
 
     async fn get(&self, key: &str) -> anyhow::Result<Option<(Bytes, UpdateVersion)>> {
+        self.count("GET", key);
         match self.store.get(&self.path(key)).await {
             Ok(r) => {
                 let version = UpdateVersion { e_tag: r.meta.e_tag.clone(), version: r.meta.version.clone() };
@@ -162,6 +170,7 @@ impl S3Log {
     }
 
     async fn create(&self, key: &str, body: Bytes) -> object_store::Result<()> {
+        self.count("PUT", key);
         self.store.put_opts(&self.path(key), body.into(), PutMode::Create.into()).await.map(drop)
     }
 
@@ -191,6 +200,7 @@ impl S3Log {
         let to = bound(now_ms() - self.config.lag.as_millis() as u64);
         if to > *w {
             let mode = version.clone().map_or(PutMode::Create, PutMode::Update);
+            self.count("PUT", "watermark");
             self.store.put_opts(&self.path("watermark"), to.into(), mode.into()).await?;
         }
         Ok(())
@@ -199,6 +209,7 @@ impl S3Log {
     /// Lists command names after `after` and up to `upto`, ascending, at most `max`.
     pub async fn commands(&self, after: &str, upto: &str, max: usize) -> anyhow::Result<Vec<String>> {
         let prefix = self.path("cmd");
+        self.count("LIST", "cmd");
         let mut list = match after {
             "" => self.store.list(Some(&prefix)),
             _ => self.store.list_with_offset(Some(&prefix), &self.path(&format!("cmd/{after}"))),
