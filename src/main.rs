@@ -3,7 +3,9 @@ mod bench_distributed;
 mod log;
 mod node;
 mod s2;
+mod s3load;
 mod s3log;
+mod s3mem;
 mod server;
 mod sim;
 mod sql;
@@ -112,6 +114,10 @@ enum Cmd {
     Sim(sim::SimArgs),
     /// The S3 object log under a counter workload, then checks of its effects.
     S3logBench(s3log::bench::BenchArgs),
+    /// An in-memory, non-persistent S3 endpoint with just what the S3 log uses.
+    S3Mem(s3mem::Args),
+    /// Raw HTTP/1.1 load on an S3 endpoint: unsigned requests back to back on keep-alive connections.
+    S3Load(s3load::Args),
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -306,6 +312,9 @@ async fn main() -> anyhow::Result<()> {
                 std::process::exit(1);
             }
         }
+        // Each runs on its own runtime, sized by --threads.
+        Cmd::S3Mem(args) => std::thread::spawn(move || s3mem::main(args)).join().expect("s3-mem thread")?,
+        Cmd::S3Load(args) => std::thread::spawn(move || s3load::main(args)).join().expect("s3-load thread")?,
     }
     Ok(())
 }

@@ -12,6 +12,10 @@ bytes = "1"
 clap = { version = "4", features = ["derive", "env"] }
 dotenvy = "0.15"
 futures = "0.3"
+http-body-util = "0.1"
+httparse = "1"
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
 object_store = { version = "0.14", features = ["aws"] }
 rand = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "http2"] }
