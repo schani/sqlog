@@ -40,7 +40,7 @@ pub struct BenchArgs {
     seconds: u64,
     #[arg(long, default_value_t = 1000)]
     lag_ms: u64,
-    /// Stop one producer this long into the run.
+    /// Stop the producer that has written the most effects this long into the run.
     #[arg(long)]
     kill_producer_after_secs: Option<u64>,
     /// Fraction of submissions that pause 0..3×lag before their PUT.
@@ -128,11 +128,12 @@ pub async fn run(log: S3Log, cfg: BenchConfig) -> anyhow::Result<bool> {
     let producers: Vec<_> = (0..cfg.producers).map(|_| Replica::start(log.clone(), Counters::default(), true)).collect();
     let readers: Vec<_> = (0..cfg.readers).map(|_| Replica::start(log.clone(), Counters::default(), false).0).collect();
     if let Some(after) = cfg.kill_producer_after {
-        let victim = producers[0].1.clone();
+        let producers = producers.clone();
         tokio::spawn(async move {
             sleep(after).await;
-            victim.abort();
-            println!("killed producer 0 at {after:?}");
+            let i = (0..producers.len()).max_by_key(|&i| producers[i].0.stats.written.load(Relaxed)).unwrap();
+            producers[i].1.abort();
+            println!("killed producer {i} at {after:?}");
         });
     }
 
@@ -320,7 +321,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn end_to_end() {
-        let config = Config { lag: Duration::from_millis(200), poll: Duration::from_millis(10), max_batch: 50 };
+        let config = Config { lag: Duration::from_millis(200), poll: Duration::from_millis(10), max_batch: 50, takeover: Duration::from_millis(500) };
         let log = S3Log::new(super::super::memory(), "test", config);
         let cfg = BenchConfig { clients: 20, producers: 2, readers: 1, duration: Duration::from_secs(2), kill_producer_after: None, slow_frac: 0.2, output: None, no_wait: false };
         assert!(run(log, cfg).await.unwrap());
