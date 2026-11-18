@@ -1241,11 +1241,15 @@ mod tests {
         let w1 = SqlNode::start(logs.clone(), SqlConfig::default());
         let w2 = SqlNode::start(logs, SqlConfig::default());
         assert!(!aborted(&run(&producer, "CREATE TABLE b(x BLOB)").await));
-        let fx_before = producer.progress().fx_next;
         let sql = "INSERT INTO b VALUES (randomblob(600000))";
         let (a, b) = tokio::join!(w1.execute(txn(sql)), w2.execute(txn(sql)));
-        assert!(!aborted(&a.unwrap().outcome) && !aborted(&b.unwrap().outcome));
-        assert!(producer.progress().fx_next - fx_before >= 2);
+        let (a, b) = (a.unwrap(), b.unwrap());
+        assert!(!aborted(&a.outcome) && !aborted(&b.outcome));
+        // Each writer learns its outcome from its own copy of the log, possibly before the
+        // producer has finished appending, so check which effects delivered the outcomes, and
+        // wait for the producer to apply both before comparing.
+        assert_ne!(a.fx_seq, b.fx_seq);
+        producer.wait_fx(a.fx_seq.max(b.fx_seq) + 1).await;
         assert_same(&producer, &w1).await;
     }
 }
