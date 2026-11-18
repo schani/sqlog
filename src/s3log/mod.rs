@@ -1,6 +1,7 @@
 //! A command queue and effect log stored as S3 objects, as specified in tla/S3Log.tla.
 //!
 //! - `<prefix>/cmd/<name>`: one command, `<name>` a UUIDv7, written once with `If-None-Match: *`.
+//!   A small command's key is `<name>.<body in base64url>`, so producers find it in the listing.
 //! - `<prefix>/watermark`: a command name; absent is "". It only rises, by compare-and-set.
 //!   A command whose writer sees it above the watermark after the PUT will be effected.
 //! - `<prefix>/fx/<n>`: effect n = 1, 2, …, created with `If-None-Match: *`, so the first
@@ -18,6 +19,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
 use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt};
 use object_store::aws::{AmazonS3Builder, S3ConditionalPut};
@@ -111,6 +114,15 @@ pub fn bound(ms: u64) -> String {
     Uuid::from_u128((ms as u128) << 80).to_string()
 }
 
+/// The longest key segment a command's body may be stored in: filesystem-backed stores
+/// such as RustFS keep each segment as a file name.
+const MAX_SEGMENT: usize = 255;
+
+fn cmd_key(name: &str, body: &[u8]) -> String {
+    let inline = B64.encode(body);
+    if name.len() + 1 + inline.len() <= MAX_SEGMENT { format!("cmd/{name}.{inline}") } else { format!("cmd/{name}") }
+}
+
 fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64
 }
@@ -182,7 +194,7 @@ impl S3Log {
     pub async fn submit(&self, body: Vec<u8>, pause: Duration) -> Submit {
         let name = Uuid::now_v7().to_string();
         sleep(pause).await;
-        if self.create(&format!("cmd/{name}"), body.into()).await.is_err() {
+        if self.create(&cmd_key(&name, &body), body.into()).await.is_err() {
             return Submit::Unknown(name);
         }
         match self.watermark().await {
@@ -210,24 +222,32 @@ impl S3Log {
         Ok(())
     }
 
-    /// Lists command names after `after` and up to `upto`, ascending, at most `max`.
-    pub async fn commands(&self, after: &str, upto: &str, max: usize) -> anyhow::Result<Vec<String>> {
+    /// Lists commands after `after` and up to `upto`, ascending, at most `max`: their names, and
+    /// their bodies if the key holds them.
+    pub async fn commands(&self, after: &str, upto: &str, max: usize) -> anyhow::Result<Vec<(String, Option<Vec<u8>>)>> {
         let prefix = self.path("cmd");
         self.count("LIST", "cmd");
         let mut list = match after {
             "" => self.store.list(Some(&prefix)),
             _ => self.store.list_with_offset(Some(&prefix), &self.path(&format!("cmd/{after}"))),
         };
-        let mut names: Vec<String> = Vec::new();
+        let mut cmds: Vec<(String, Option<Vec<u8>>)> = Vec::new();
         while let Some(meta) = list.try_next().await? {
-            let name = meta.location.filename().context("bad command key")?.to_string();
-            anyhow::ensure!(name.as_str() > names.last().map_or(after, String::as_str), "listing out of order at {name}");
-            if name.as_str() > upto || names.len() == max {
+            let key = meta.location.filename().context("bad command key")?;
+            let (name, body) = match key.split_once('.') {
+                Some((name, inline)) => (name, Some(B64.decode(inline)?)),
+                None => (key, None),
+            };
+            if name == after {
+                continue; // `after.<body>` sorts after `after`
+            }
+            anyhow::ensure!(name > cmds.last().map_or(after, |c| c.0.as_str()), "listing out of order at {name}");
+            if name > upto || cmds.len() == max {
                 break;
             }
-            names.push(name);
+            cmds.push((name.to_string(), body));
         }
-        Ok(names)
+        Ok(cmds)
     }
 
     async fn command(&self, name: &str) -> anyhow::Result<Vec<u8>> {
@@ -440,20 +460,26 @@ impl<S: StateMachine> Replica<S> {
         if last >= wm.0 {
             return Ok(false);
         }
-        let names = self.log.commands(&last, &wm.0, self.log.config.max_batch).await?;
+        let cmds = self.log.commands(&last, &wm.0, self.log.config.max_batch).await?;
         lap(2);
-        if names.is_empty() {
+        if cmds.is_empty() {
             return Ok(false);
         }
         // Owned names and log: borrowing them here trips rustc's Send check on the task.
-        let fetch = |n: String| {
+        let fetch = |(name, body): (String, Option<Vec<u8>>)| {
             let log = self.log.clone();
-            async move { log.command(&n).await }
+            async move {
+                let body = match body {
+                    Some(body) => body,
+                    None => log.command(&name).await?,
+                };
+                anyhow::Ok((name, body))
+            }
         };
-        let bodies: Vec<_> = futures::stream::iter(names.clone()).map(fetch).buffered(32).try_collect().await?;
+        let cmds: Vec<_> = futures::stream::iter(cmds).map(fetch).buffered(32).try_collect().await?;
         lap(3);
         let mut state = self.state();
-        let txns: Vec<_> = names.into_iter().zip(bodies).map(|(name, body)| Txn { result: state.execute(&body), name, body }).collect();
+        let txns: Vec<_> = cmds.into_iter().map(|(name, body)| Txn { result: state.execute(&body), name, body }).collect();
         let fx = Effect { producer: self.id, last: txns.last().unwrap().name.clone(), txns };
         lap(4);
         let created = self.log.create_effect(next, &fx).await?;
@@ -530,6 +556,20 @@ mod tests {
         for (name, outcome) in [("0", Outcome::Dead), ("a", Outcome::Ran(b"a".to_vec())), ("b", Outcome::Dead), ("c", Outcome::Ran(b"c".to_vec()))] {
             assert_eq!(log.find(name, 2).await.unwrap(), outcome);
         }
+    }
+
+    #[tokio::test]
+    async fn inline_bodies() {
+        let log = S3Log::new(memory(), "t", Config::default());
+        let (small, big) = (b"small".to_vec(), vec![b'x'; 300]);
+        for body in [&small, &big] {
+            assert!(matches!(log.submit(body.clone(), Duration::ZERO).await, Submit::Acked(_)));
+        }
+        let cmds = log.commands("", "~", 10).await.unwrap();
+        assert_eq!(cmds.len(), 2);
+        assert_eq!(cmds[0].1.as_ref(), Some(&small));
+        assert_eq!((cmds[1].1.as_ref(), log.command(&cmds[1].0).await.unwrap()), (None, big));
+        assert_eq!(log.commands(&cmds[0].0, "~", 10).await.unwrap().len(), 1);
     }
 
     #[tokio::test]
