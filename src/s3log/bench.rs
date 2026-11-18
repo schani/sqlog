@@ -321,7 +321,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn end_to_end() {
-        let config = Config { lag: Duration::from_millis(200), poll: Duration::from_millis(10), max_batch: 50, takeover: Duration::from_millis(500) };
+        let config = Config { lag: Duration::from_millis(200), poll: Duration::from_millis(10), max_batch: 50 };
         let log = S3Log::new(super::super::memory(), "test", config);
         let cfg = BenchConfig { clients: 20, producers: 2, readers: 1, duration: Duration::from_secs(2), kill_producer_after: None, slow_frac: 0.2, output: None, no_wait: false };
         assert!(run(log, cfg).await.unwrap());

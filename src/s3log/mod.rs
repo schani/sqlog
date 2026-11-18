@@ -44,20 +44,16 @@ pub struct Config {
     pub poll: Duration,
     /// The most commands one effect runs.
     pub max_batch: usize,
-    /// A producer that didn't write the latest effect stands by until it is this old.
-    pub takeover: Duration,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Self { lag: Duration::from_millis(1000), poll: Duration::from_millis(50), max_batch: 1000, takeover: Duration::from_secs(2) }
+        Self { lag: Duration::from_millis(1000), poll: Duration::from_millis(50), max_batch: 1000 }
     }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Effect {
-    /// The replica that wrote it.
-    pub producer: u64,
     /// The greatest command name this effect ran; every name up to it is decided.
     pub last: String,
     /// The commands it ran, in name order.
@@ -314,15 +310,11 @@ struct Applied {
     next: u64,
     /// `last` of the applied effects.
     last: String,
-    /// Who wrote the latest applied effect, and when this replica applied it.
-    by: u64,
-    at: std::time::Instant,
     waiters: BTreeMap<String, Vec<oneshot::Sender<Outcome>>>,
 }
 
 /// A state machine following the effects; a producer also writes them.
 pub struct Replica<S> {
-    id: u64,
     log: S3Log,
     state: Mutex<S>,
     applied: Mutex<Applied>,
@@ -332,8 +324,8 @@ pub struct Replica<S> {
 impl<S: StateMachine> Replica<S> {
     /// Starts applying effects from the first. Aborting the handle stops the replica.
     pub fn start(log: S3Log, state: S, producer: bool) -> (Arc<Self>, AbortHandle) {
-        let applied = Applied { next: 1, last: String::new(), by: 0, at: std::time::Instant::now(), waiters: BTreeMap::new() };
-        let replica = Arc::new(Self { id: rand::random(), log, state: Mutex::new(state), applied: Mutex::new(applied), stats: Stats::default() });
+        let applied = Applied { next: 1, last: String::new(), waiters: BTreeMap::new() };
+        let replica = Arc::new(Self { log, state: Mutex::new(state), applied: Mutex::new(applied), stats: Stats::default() });
         let task = tokio::spawn(replica.clone().run(producer));
         (replica, task.abort_handle())
     }
@@ -407,7 +399,6 @@ impl<S: StateMachine> Replica<S> {
         let mut a = self.applied.lock().unwrap();
         a.next = n + 1;
         a.last = fx.last.clone();
-        (a.by, a.at) = (fx.producer, std::time::Instant::now());
         for t in &fx.txns {
             for tx in a.waiters.remove(&t.name).unwrap_or_default() {
                 let _ = tx.send(Outcome::Ran(t.result.clone()));
@@ -428,11 +419,6 @@ impl<S: StateMachine> Replica<S> {
         };
         while self.follow().await? {}
         lap(0);
-        // Another producer is active: leave it the work, so commands aren't fetched twice.
-        let (by, at) = { let a = self.applied.lock().unwrap(); (a.by, a.at) };
-        if by != 0 && by != self.id && at.elapsed() < self.log.config.takeover {
-            return Ok(false);
-        }
         // A value the watermark held before the listing is all safety needs, so the one we
         // just wrote will do. Otherwise read it: losing the race is fine.
         *wm = match self.log.raise(wm).await {
@@ -458,7 +444,7 @@ impl<S: StateMachine> Replica<S> {
         lap(3);
         let mut state = self.state();
         let txns: Vec<_> = names.into_iter().zip(bodies).map(|(name, body)| Txn { result: state.execute(&body), name, body }).collect();
-        let fx = Effect { producer: self.id, last: txns.last().unwrap().name.clone(), txns };
+        let fx = Effect { last: txns.last().unwrap().name.clone(), txns };
         lap(4);
         let created = self.log.create_effect(next, &fx).await?;
         lap(5);
@@ -528,7 +514,7 @@ mod tests {
         let log = S3Log::new(memory(), "t", Config::default());
         let txn = |name: &str| Txn { name: name.into(), body: vec![], result: name.as_bytes().to_vec() };
         for (n, last, names) in [(1, "b", vec!["a"]), (2, "d", vec!["c", "d"])] {
-            let fx = Effect { producer: 1, last: last.into(), txns: names.into_iter().map(txn).collect() };
+            let fx = Effect { last: last.into(), txns: names.into_iter().map(txn).collect() };
             assert!(matches!(log.create_effect(n, &fx).await.unwrap(), Created::Ours));
         }
         for (name, outcome) in [("0", Outcome::Dead), ("a", Outcome::Ran(b"a".to_vec())), ("b", Outcome::Dead), ("c", Outcome::Ran(b"c".to_vec()))] {
@@ -539,7 +525,7 @@ mod tests {
     #[tokio::test]
     async fn effect_race() {
         let log = S3Log::new(memory(), "t", Config::default());
-        let fx = |last: &str| Effect { producer: 1, last: last.into(), txns: vec![Txn { name: last.into(), body: vec![], result: vec![] }] };
+        let fx = |last: &str| Effect { last: last.into(), txns: vec![Txn { name: last.into(), body: vec![], result: vec![] }] };
         assert!(matches!(log.create_effect(1, &fx("a")).await.unwrap(), Created::Ours));
         assert!(matches!(log.create_effect(1, &fx("a")).await.unwrap(), Created::Same));
         assert!(matches!(log.create_effect(1, &fx("b")).await.unwrap(), Created::Theirs(t) if t == fx("a")));
