@@ -205,14 +205,10 @@ pub async fn run(log: S3Log, cfg: BenchConfig) -> anyhow::Result<bool> {
     }
 
     // 2. Acked commands ran; 3. Unknown ones ran or are dead, and clients saw what the effects say.
-    let (mut acked, mut unknown, mut rejected, mut n_ran, mut n_dead, mut timeouts) = (0, 0, 0, 0, 0, 0);
+    let (mut acked, mut unknown, mut n_ran, mut n_dead, mut timeouts) = (0, 0, 0, 0, 0);
     let (mut ack_ms, mut done_ms) = (Vec::new(), Vec::new());
     for s in &samples {
         let name = match &s.submit {
-            Submit::Rejected => {
-                rejected += 1;
-                continue;
-            }
             Submit::Acked(n) => {
                 acked += 1;
                 ack_ms.push(s.ack.as_secs_f64() * 1e3);
@@ -280,7 +276,7 @@ pub async fn run(log: S3Log, cfg: BenchConfig) -> anyhow::Result<bool> {
 
     let txns = ran.len();
     println!(
-        "{} clients, {secs:.1}s: {acked} acked, {unknown} unknown, {rejected} rejected; outcomes {n_ran} ran, {n_dead} dead, {timeouts} timed out",
+        "{} clients, {secs:.1}s: {acked} acked, {unknown} unknown; outcomes {n_ran} ran, {n_dead} dead, {timeouts} timed out",
         cfg.clients
     );
     println!("{} effects, {txns} commands ({:.1}/effect), {:.0} cmd/s; {} unexecuted command objects", effects.len(), txns as f64 / effects.len().max(1) as f64, txns as f64 / secs, left.len());
@@ -297,7 +293,7 @@ pub async fn run(log: S3Log, cfg: BenchConfig) -> anyhow::Result<bool> {
     if let Some(path) = &cfg.output {
         let report = json!({
             "clients": cfg.clients, "producers": cfg.producers, "lag_ms": lag.as_millis() as u64, "secs": secs,
-            "acked": acked, "unknown": unknown, "rejected": rejected, "ran": n_ran, "dead": n_dead, "timeouts": timeouts,
+            "acked": acked, "unknown": unknown, "ran": n_ran, "dead": n_dead, "timeouts": timeouts,
             "commands": txns, "commands_per_sec": txns as f64 / secs, "effect_sizes": effects.iter().map(|fx| fx.txns.len()).collect::<Vec<_>>(),
             "ack_ms": ack_ms, "done_ms": done_ms, "pass": fails.is_empty(),
         });

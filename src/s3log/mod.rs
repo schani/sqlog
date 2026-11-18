@@ -71,8 +71,6 @@ pub struct Txn {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Submit {
-    /// Nothing was written.
-    Rejected,
     /// Will be effected.
     Acked(String),
     /// May or may not be effected; the outcome tells.
@@ -167,13 +165,9 @@ impl S3Log {
         self.store.put_opts(&self.path(key), body.into(), PutMode::Create.into()).await.map(drop)
     }
 
-    /// Writes a command, once, never retrying. `pause` delays the PUT after the first
-    /// watermark check, to test late PUTs.
+    /// Writes a command, once, never retrying. `pause` delays the PUT, to test late PUTs.
     pub async fn submit(&self, body: Vec<u8>, pause: Duration) -> Submit {
         let name = Uuid::now_v7().to_string();
-        if !matches!(self.watermark().await, Ok((w, _)) if name > w) {
-            return Submit::Rejected;
-        }
         sleep(pause).await;
         if self.create(&format!("cmd/{name}"), body.into()).await.is_err() {
             return Submit::Unknown(name);
