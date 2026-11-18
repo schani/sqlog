@@ -268,7 +268,7 @@ pub async fn run(log: S3Log, cfg: BenchConfig) -> anyhow::Result<bool> {
 
     // 5. Commands left in the bucket were decided dead, or are above the watermark, and none was acked.
     let acked_names: Vec<_> = samples.iter().filter_map(|s| if let Submit::Acked(n) = &s.submit { Some(n.as_str()) } else { None }).collect();
-    let left: Vec<_> = log.commands("", "~", usize::MAX).await?.into_iter().map(|c| c.0).filter(|n| !ran.contains_key(n.as_str())).collect();
+    let left: Vec<_> = log.commands("", "~", usize::MAX).await?.into_iter().filter(|n| !ran.contains_key(n.as_str())).collect();
     for n in &left {
         if (n.as_str() > last && *n <= w) || acked_names.contains(&n.as_str()) {
             fails.push(format!("command {n} left behind"));
