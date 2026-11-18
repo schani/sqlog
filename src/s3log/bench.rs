@@ -11,7 +11,7 @@ use serde::Deserialize;
 use serde_json::json;
 use tokio::time::{Instant, sleep, timeout};
 
-use super::{Config, Outcome, Replica, S3Log, StateMachine, Submit};
+use super::{Config, Outcome, PHASES, Replica, S3Log, StateMachine, Submit};
 
 #[derive(clap::Args)]
 pub struct BenchArgs {
@@ -46,6 +46,9 @@ pub struct BenchArgs {
     /// Fraction of submissions that pause 0..3×lag before their PUT.
     #[arg(long, default_value_t = 0.05)]
     slow_frac: f64,
+    /// Clients submit without waiting for outcomes.
+    #[arg(long)]
+    no_wait: bool,
     /// Write a JSON report.
     #[arg(long)]
     output: Option<std::path::PathBuf>,
@@ -65,6 +68,7 @@ pub struct BenchConfig {
     pub kill_producer_after: Option<Duration>,
     pub slow_frac: f64,
     pub output: Option<std::path::PathBuf>,
+    pub no_wait: bool,
 }
 
 pub async fn main(a: BenchArgs) -> anyhow::Result<bool> {
@@ -83,6 +87,7 @@ pub async fn main(a: BenchArgs) -> anyhow::Result<bool> {
         kill_producer_after: a.kill_producer_after_secs.map(Duration::from_secs),
         slow_frac: a.slow_frac,
         output: a.output,
+        no_wait: a.no_wait,
     };
     run(log, cfg).await
 }
@@ -119,7 +124,7 @@ struct Sample {
 pub async fn run(log: S3Log, cfg: BenchConfig) -> anyhow::Result<bool> {
     anyhow::ensure!(cfg.producers > 0 && cfg.readers > 0, "need a producer and a reader");
     let lag = log.config.lag;
-    let wait = 5 * lag + Duration::from_secs(10);
+    let wait = 5 * lag + Duration::from_secs(if cfg.no_wait { 300 } else { 10 });
     let producers: Vec<_> = (0..cfg.producers).map(|_| Replica::start(log.clone(), Counters::default(), true)).collect();
     let readers: Vec<_> = (0..cfg.readers).map(|_| Replica::start(log.clone(), Counters::default(), false).0).collect();
     if let Some(after) = cfg.kill_producer_after {
@@ -135,7 +140,7 @@ pub async fn run(log: S3Log, cfg: BenchConfig) -> anyhow::Result<bool> {
     let deadline = t0 + cfg.duration;
     let clients: Vec<_> = (0..cfg.clients)
         .map(|c| {
-            let (log, reader, slow) = (log.clone(), readers[c % readers.len()].clone(), cfg.slow_frac);
+            let (log, reader, slow, no_wait) = (log.clone(), readers[c % readers.len()].clone(), cfg.slow_frac, cfg.no_wait);
             tokio::spawn(async move {
                 let mut samples = Vec::new();
                 while Instant::now() < deadline {
@@ -148,8 +153,8 @@ pub async fn run(log: S3Log, cfg: BenchConfig) -> anyhow::Result<bool> {
                     let submit = log.submit(json!({"key": format!("k{key}"), "add": add}).to_string().into_bytes(), pause).await;
                     let ack = start.elapsed();
                     let outcome = match &submit {
-                        Submit::Acked(n) | Submit::Unknown(n) => timeout(wait, reader.wait_outcome(n)).await.ok().and_then(Result::ok),
-                        Submit::Rejected => None,
+                        Submit::Acked(n) | Submit::Unknown(n) if !no_wait => timeout(wait, reader.wait_outcome(n)).await.ok().and_then(Result::ok),
+                        _ => None,
                     };
                     samples.push(Sample { submit, outcome, ack, done: start.elapsed() });
                 }
@@ -283,6 +288,9 @@ pub async fn run(log: S3Log, cfg: BenchConfig) -> anyhow::Result<bool> {
         let [written, same, lost] = [&p.stats.written, &p.stats.same, &p.stats.races_lost].map(|s| s.load(Relaxed));
         let killed = if h.is_finished() { " (killed)" } else { "" };
         println!("  producer {i}: {written} effects written, {same} found identical, {lost} races lost{killed}");
+        let cycles = p.stats.cycles.load(Relaxed).max(1) as f64;
+        let phases: Vec<_> = PHASES.iter().zip(&p.stats.phase_us).map(|(n, us)| format!("{n} {:.0}", us.load(Relaxed) as f64 / cycles / 1e3)).collect();
+        println!("    ms per cycle ({cycles} cycles): {}", phases.join(", "));
     }
     println!("latency ms submit->ack:    {}", percentiles(&mut ack_ms));
     println!("latency ms submit->result: {}", percentiles(&mut done_ms));
@@ -316,7 +324,7 @@ mod tests {
     async fn end_to_end() {
         let config = Config { lag: Duration::from_millis(200), poll: Duration::from_millis(10), max_batch: 50 };
         let log = S3Log::new(super::super::memory(), "test", config);
-        let cfg = BenchConfig { clients: 20, producers: 2, readers: 1, duration: Duration::from_secs(2), kill_producer_after: None, slow_frac: 0.2, output: None };
+        let cfg = BenchConfig { clients: 20, producers: 2, readers: 1, duration: Duration::from_secs(2), kill_producer_after: None, slow_frac: 0.2, output: None, no_wait: false };
         assert!(run(log, cfg).await.unwrap());
     }
 }

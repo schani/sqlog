@@ -290,7 +290,14 @@ pub struct Stats {
     pub same: AtomicU64,
     pub races_lost: AtomicU64,
     pub diverged: AtomicU64,
+    /// Producer cycles that wrote or lost an effect.
+    pub cycles: AtomicU64,
+    /// Microseconds spent in each of `PHASES`.
+    pub phase_us: [AtomicU64; 6],
 }
+
+/// The parts of a producer cycle, as timed in `Stats::phase_us`.
+pub const PHASES: [&str; 6] = ["catch up", "watermark", "list", "fetch", "execute", "effect"];
 
 struct Applied {
     /// The next effect to apply.
@@ -399,15 +406,23 @@ impl<S: StateMachine> Replica<S> {
 
     /// One producer cycle; false if there was nothing to do.
     async fn produce(&self, wm: &mut Watermark) -> anyhow::Result<bool> {
+        let mut t = std::time::Instant::now();
+        let mut lap = |phase: usize| {
+            self.stats.phase_us[phase].fetch_add(t.elapsed().as_micros() as u64, Relaxed);
+            t = std::time::Instant::now();
+        };
         while self.follow().await? {}
+        lap(0);
         // Losing the race is fine: the read below sees the winner's value.
         let _ = self.log.raise(wm).await;
         *wm = self.log.watermark().await?;
+        lap(1);
         let (next, last) = self.progress();
         if last >= wm.0 {
             return Ok(false);
         }
         let names = self.log.commands(&last, &wm.0, self.log.config.max_batch).await?;
+        lap(2);
         if names.is_empty() {
             return Ok(false);
         }
@@ -417,10 +432,15 @@ impl<S: StateMachine> Replica<S> {
             async move { log.command(&n).await }
         };
         let bodies: Vec<_> = futures::stream::iter(names.clone()).map(fetch).buffered(32).try_collect().await?;
+        lap(3);
         let mut state = self.state();
         let txns: Vec<_> = names.into_iter().zip(bodies).map(|(name, body)| Txn { result: state.execute(&body), name, body }).collect();
         let fx = Effect { last: txns.last().unwrap().name.clone(), txns };
-        match self.log.create_effect(next, &fx).await? {
+        lap(4);
+        let created = self.log.create_effect(next, &fx).await?;
+        lap(5);
+        self.stats.cycles.fetch_add(1, Relaxed);
+        match created {
             created @ (Created::Ours | Created::Same) => {
                 *self.state.lock().unwrap() = state;
                 self.resolve(next, &fx);
