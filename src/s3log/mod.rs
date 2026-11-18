@@ -210,16 +210,17 @@ impl S3Log {
         })
     }
 
-    /// Raises the watermark from `w` to `bound(now - lag)` if that is higher. Fails if it
-    /// changed since `w` was read.
-    async fn raise(&self, (w, version): &Watermark) -> anyhow::Result<()> {
+    /// Raises the watermark from `w` to `bound(now - lag)` if that is higher, returning the new
+    /// value. Fails if it changed since `w` was read.
+    async fn raise(&self, (w, version): &Watermark) -> anyhow::Result<Option<Watermark>> {
         let to = bound(now_ms() - self.config.lag.as_millis() as u64);
-        if to > *w {
-            let mode = version.clone().map_or(PutMode::Create, PutMode::Update);
-            self.count("PUT", "watermark");
-            self.store.put_opts(&self.path("watermark"), to.into(), mode.into()).await?;
+        if to <= *w {
+            return Ok(None);
         }
-        Ok(())
+        let mode = version.clone().map_or(PutMode::Create, PutMode::Update);
+        self.count("PUT", "watermark");
+        let r = self.store.put_opts(&self.path("watermark"), to.clone().into(), mode.into()).await?;
+        Ok(Some((to, Some(UpdateVersion { e_tag: r.e_tag, version: r.version }))))
     }
 
     /// Lists commands after `after` and up to `upto`, ascending, at most `max`: their names, and
@@ -452,9 +453,12 @@ impl<S: StateMachine> Replica<S> {
         if by != 0 && by != self.id && at.elapsed() < self.log.config.takeover {
             return Ok(false);
         }
-        // Losing the race is fine: the read below sees the winner's value.
-        let _ = self.log.raise(wm).await;
-        *wm = self.log.watermark().await?;
+        // A value the watermark held before the listing is all safety needs, so the one we
+        // just wrote will do. Otherwise read it: losing the race is fine.
+        *wm = match self.log.raise(wm).await {
+            Ok(Some(raised)) => raised,
+            _ => self.log.watermark().await?,
+        };
         lap(1);
         let (next, last) = self.progress();
         if last >= wm.0 {
