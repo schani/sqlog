@@ -1,6 +1,6 @@
-//! An in-memory S3 endpoint holding just what object_store's S3 client (as `s3log::s3` builds
-//! it) and s3-load send, so the store is never the bottleneck. Nothing persists; requests are
-//! not authenticated.
+//! An in-memory S3 endpoint holding just what the S3 log's clients (`s3log::s3`,
+//! `s3log::s3_lean`) and s3-load send, so the store is never the bottleneck. Nothing
+//! persists; requests are not authenticated.
 //!
 //! - `PUT /<bucket>`: a no-op; every bucket exists.
 //! - `PUT /<bucket>/<key>`: stores the body, honouring `If-None-Match: *` and `If-Match`.
@@ -286,7 +286,7 @@ fn iso_date(secs: u64) -> String {
 }
 
 /// Year, month, day, hour, minute, second of a Unix time (Howard Hinnant's `civil_from_days`).
-fn civil(secs: u64) -> (u64, u64, u64, u64, u64, u64) {
+pub(crate) fn civil(secs: u64) -> (u64, u64, u64, u64, u64, u64) {
     let (days, t) = (secs / 86400 + 719_468, secs % 86400);
     let (era, doe) = (days / 146_097, days % 146_097);
     let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
@@ -309,7 +309,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(serve(listener));
-        crate::s3log::s3(&endpoint, "sqlog", "ak", "sk", "us-east-1").unwrap()
+        crate::s3log::s3_object_store(&endpoint, "sqlog", "ak", "sk", "us-east-1").unwrap()
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

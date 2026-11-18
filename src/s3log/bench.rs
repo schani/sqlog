@@ -27,6 +27,9 @@ pub struct BenchArgs {
     secret_key: String,
     #[arg(long, default_value = "us-east-1")]
     region: String,
+    /// The S3 client, for `--store s3`.
+    #[arg(long, value_enum, default_value = "lean")]
+    client: super::Client,
     /// Key prefix; defaults to a fresh one.
     #[arg(long)]
     prefix: Option<String>,
@@ -74,7 +77,7 @@ pub struct BenchConfig {
 pub async fn main(a: BenchArgs) -> anyhow::Result<bool> {
     let store = match a.store {
         Store::Mem => super::memory(),
-        Store::S3 => super::s3(&a.endpoint, &a.bucket, &a.access_key, &a.secret_key, &a.region)?,
+        Store::S3 => super::s3_with(a.client, &a.endpoint, &a.bucket, &a.access_key, &a.secret_key, &a.region)?,
     };
     let prefix = a.prefix.unwrap_or_else(|| format!("bench-{:016x}", rand::random::<u64>()));
     println!("prefix {prefix}");

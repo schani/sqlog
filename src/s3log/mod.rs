@@ -11,6 +11,10 @@
 //! effect. Readers apply effects by re-executing their commands, and resolve outcomes.
 
 pub mod bench;
+pub mod client;
+mod store;
+
+pub use store::{Objects, PutError, Store};
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
@@ -21,8 +25,7 @@ use anyhow::Context;
 use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt};
 use object_store::aws::{AmazonS3Builder, S3ConditionalPut};
-use object_store::path::Path;
-use object_store::{ObjectStore, ObjectStoreExt, PutMode, RetryConfig, UpdateVersion};
+use object_store::{ObjectStore, RetryConfig};
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 use tokio::task::AbortHandle;
@@ -111,12 +114,37 @@ fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64
 }
 
-pub fn memory() -> Arc<dyn ObjectStore> {
-    Arc::new(object_store::memory::InMemory::new())
+pub fn memory() -> Arc<dyn Store> {
+    Arc::new(Objects(Arc::new(object_store::memory::InMemory::new())))
 }
 
-/// An S3-compatible bucket. The client never retries; the protocol decides what to retry.
-pub fn s3(endpoint: &str, bucket: &str, access_key: &str, secret_key: &str, region: &str) -> anyhow::Result<Arc<dyn ObjectStore>> {
+/// The S3 clients there are.
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+pub enum Client {
+    ObjectStore,
+    Lean,
+}
+
+/// An S3-compatible bucket through `client`.
+pub fn s3_with(client: Client, endpoint: &str, bucket: &str, access_key: &str, secret_key: &str, region: &str) -> anyhow::Result<Arc<dyn Store>> {
+    match client {
+        Client::ObjectStore => s3(endpoint, bucket, access_key, secret_key, region),
+        Client::Lean => s3_lean(endpoint, bucket, access_key, secret_key, region),
+    }
+}
+
+/// An S3-compatible bucket through object_store's client.
+pub fn s3(endpoint: &str, bucket: &str, access_key: &str, secret_key: &str, region: &str) -> anyhow::Result<Arc<dyn Store>> {
+    Ok(Arc::new(Objects(s3_object_store(endpoint, bucket, access_key, secret_key, region)?)))
+}
+
+/// An S3-compatible bucket through the lean client in `client`.
+pub fn s3_lean(endpoint: &str, bucket: &str, access_key: &str, secret_key: &str, region: &str) -> anyhow::Result<Arc<dyn Store>> {
+    Ok(Arc::new(client::S3Client::new(endpoint, bucket, access_key, secret_key, region)?))
+}
+
+/// object_store's S3 client. It never retries; the protocol decides what to retry.
+pub fn s3_object_store(endpoint: &str, bucket: &str, access_key: &str, secret_key: &str, region: &str) -> anyhow::Result<Arc<dyn ObjectStore>> {
     let store = AmazonS3Builder::new()
         .with_endpoint(endpoint)
         .with_allow_http(true)
@@ -133,18 +161,18 @@ pub fn s3(endpoint: &str, bucket: &str, access_key: &str, secret_key: &str, regi
 /// One database's objects under a prefix. Also the writer: see `submit`.
 #[derive(Clone)]
 pub struct S3Log {
-    store: Arc<dyn ObjectStore>,
+    store: Arc<dyn Store>,
     prefix: String,
     pub config: Config,
     /// Requests made, by kind, e.g. "GET fx".
     pub requests: Arc<Mutex<BTreeMap<String, u64>>>,
 }
 
-/// The watermark as read, with the version to compare-and-set against; None if absent.
-pub type Watermark = (String, Option<UpdateVersion>);
+/// The watermark as read, with the ETag to compare-and-set against; None if absent.
+pub type Watermark = (String, Option<String>);
 
 impl S3Log {
-    pub fn new(store: Arc<dyn ObjectStore>, prefix: &str, config: Config) -> Self {
+    pub fn new(store: Arc<dyn Store>, prefix: &str, config: Config) -> Self {
         Self { store, prefix: prefix.to_string(), config, requests: Default::default() }
     }
 
@@ -153,25 +181,18 @@ impl S3Log {
         *self.requests.lock().unwrap().entry(format!("{op} {kind}")).or_default() += 1;
     }
 
-    fn path(&self, key: &str) -> Path {
-        Path::from(format!("{}/{key}", self.prefix))
+    fn path(&self, key: &str) -> String {
+        format!("{}/{key}", self.prefix)
     }
 
-    async fn get(&self, key: &str) -> anyhow::Result<Option<(Bytes, UpdateVersion)>> {
+    async fn get(&self, key: &str) -> anyhow::Result<Option<(Bytes, String)>> {
         self.count("GET", key);
-        match self.store.get(&self.path(key)).await {
-            Ok(r) => {
-                let version = UpdateVersion { e_tag: r.meta.e_tag.clone(), version: r.meta.version.clone() };
-                Ok(Some((r.bytes().await?, version)))
-            }
-            Err(object_store::Error::NotFound { .. }) => Ok(None),
-            Err(e) => Err(e.into()),
-        }
+        self.store.get(&self.path(key)).await
     }
 
-    async fn create(&self, key: &str, body: Bytes) -> object_store::Result<()> {
+    async fn create(&self, key: &str, body: Bytes) -> Result<(), PutError> {
         self.count("PUT", key);
-        self.store.put_opts(&self.path(key), body.into(), PutMode::Create.into()).await.map(drop)
+        self.store.create(&self.path(key), body).await.map(drop)
     }
 
     /// Writes a command, once, never retrying. `pause` delays the PUT, to test late PUTs.
@@ -189,35 +210,39 @@ impl S3Log {
 
     pub async fn watermark(&self) -> anyhow::Result<Watermark> {
         Ok(match self.get("watermark").await? {
-            Some((body, version)) => (String::from_utf8(body.to_vec())?, Some(version)),
+            Some((body, etag)) => (String::from_utf8(body.to_vec())?, Some(etag)),
             None => (String::new(), None),
         })
     }
 
     /// Raises the watermark from `w` to `bound(now - lag)` if that is higher, returning the new
     /// value. Fails if it changed since `w` was read.
-    async fn raise(&self, (w, version): &Watermark) -> anyhow::Result<Option<Watermark>> {
+    async fn raise(&self, (w, etag): &Watermark) -> anyhow::Result<Option<Watermark>> {
         let to = bound(now_ms() - self.config.lag.as_millis() as u64);
         if to <= *w {
             return Ok(None);
         }
-        let mode = version.clone().map_or(PutMode::Create, PutMode::Update);
         self.count("PUT", "watermark");
-        let r = self.store.put_opts(&self.path("watermark"), to.clone().into(), mode.into()).await?;
-        Ok(Some((to, Some(UpdateVersion { e_tag: r.e_tag, version: r.version }))))
+        let (key, body) = (self.path("watermark"), Bytes::from(to.clone()));
+        let etag = match etag {
+            Some(etag) => self.store.update(&key, etag, body).await?,
+            None => self.store.create(&key, body).await?,
+        };
+        Ok(Some((to, Some(etag))))
     }
 
     /// Lists command names after `after` and up to `upto`, ascending, at most `max`.
     pub async fn commands(&self, after: &str, upto: &str, max: usize) -> anyhow::Result<Vec<String>> {
-        let prefix = self.path("cmd");
+        let dir = self.path("cmd");
         self.count("LIST", "cmd");
-        let mut list = match after {
-            "" => self.store.list(Some(&prefix)),
-            _ => self.store.list_with_offset(Some(&prefix), &self.path(&format!("cmd/{after}"))),
+        let from = match after {
+            "" => String::new(),
+            _ => self.path(&format!("cmd/{after}")),
         };
+        let mut list = self.store.list(&dir, &from);
         let mut names: Vec<String> = Vec::new();
-        while let Some(meta) = list.try_next().await? {
-            let name = meta.location.filename().context("bad command key")?.to_string();
+        while let Some(key) = list.try_next().await? {
+            let name = key.rsplit_once('/').context("bad command key")?.1.to_string();
             anyhow::ensure!(name.as_str() > names.last().map_or(after, String::as_str), "listing out of order at {name}");
             if name.as_str() > upto || names.len() == max {
                 break;

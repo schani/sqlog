@@ -1,6 +1,7 @@
 //! Raw HTTP/1.1 load on an S3 endpoint such as s3-mem: connections each send unsigned requests
 //! back to back and wait for each response. After a 1 s warm-up, reports throughput, latency
-//! and the CPU of this process and, given its pid, the server's.
+//! and the CPU of this process and, given its pid, the server's. With `--signed-client`,
+//! creates and gets go through an S3 log client instead.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -9,6 +10,8 @@ use anyhow::Context;
 use bytes::{Buf, BytesMut};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+
+use crate::s3log::{Client, Store};
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -34,6 +37,9 @@ pub struct Args {
     /// The server's pid, to report its CPU too.
     #[arg(long)]
     server_pid: Option<u32>,
+    /// Send creates or gets through this signed client (as testak/testsk), one per connection.
+    #[arg(long, value_enum)]
+    signed_client: Option<Client>,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug, clap::ValueEnum)]
@@ -66,10 +72,15 @@ struct Tally {
 pub fn main(a: Args) -> anyhow::Result<()> {
     anyhow::ensure!(a.conns > 0 && a.secs > 0 && a.pipeline > 0, "conns, secs and pipeline must be positive");
     anyhow::ensure!(a.pipeline == 1 || a.op != Op::Cas, "cas can't pipeline");
+    anyhow::ensure!(a.signed_client.is_none() || (a.pipeline == 1 && matches!(a.op, Op::Create | Op::Get)), "signed clients only create and get, unpipelined");
     let host = a.endpoint.strip_prefix("http://").context("endpoint must be http://")?.trim_end_matches('/').to_string();
     let a = Arc::new(a);
     crate::s3mem::runtime(a.threads)?.block_on(async {
         setup(&a, &host).await?;
+        let store = match a.signed_client {
+            Some(c) => Some(crate::s3log::s3_with(c, &a.endpoint, &a.bucket, "testak", "testsk", "us-east-1")?),
+            None => None,
+        };
         let t0 = Instant::now() + Duration::from_millis(200);
         let (warm, end) = (t0 + Duration::from_secs(1), t0 + Duration::from_secs(1 + a.secs));
         let me = std::process::id();
@@ -85,7 +96,7 @@ pub fn main(a: Args) -> anyhow::Result<()> {
                 (cores(b.0, e.0), b.1.zip(e.1).map(|(b, e)| cores(b, e)), secs)
             }
         });
-        let workers: Vec<_> = (0..a.conns).map(|id| tokio::spawn(worker(a.clone(), host.clone(), id, t0, warm, end))).collect();
+        let workers: Vec<_> = (0..a.conns).map(|id| tokio::spawn(worker(a.clone(), host.clone(), store.clone(), id, t0, warm, end))).collect();
         let mut all = Tally::default();
         for w in workers {
             let t = w.await?;
@@ -147,27 +158,35 @@ async fn setup(a: &Args, host: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn worker(a: Arc<Args>, host: String, id: usize, t0: Instant, warm: Instant, end: Instant) -> Tally {
+async fn worker(a: Arc<Args>, host: String, store: Option<Arc<dyn Store>>, id: usize, t0: Instant, warm: Instant, end: Instant) -> Tally {
     let mut t = Tally::default();
-    if let Err(e) = drive(&a, &host, id, t0, warm, end, &mut t).await {
+    if let Err(e) = drive(&a, &host, store.as_deref(), id, t0, warm, end, &mut t).await {
         t.errors += 1;
         t.first_error = t.first_error.or(Some(format!("{e:#}")));
     }
     t
 }
 
-async fn drive(a: &Args, host: &str, id: usize, t0: Instant, warm: Instant, end: Instant, t: &mut Tally) -> anyhow::Result<()> {
+#[allow(clippy::too_many_arguments)]
+async fn drive(a: &Args, host: &str, store: Option<&dyn Store>, id: usize, t0: Instant, warm: Instant, end: Instant, t: &mut Tally) -> anyhow::Result<()> {
     let mut c = Conn::connect(host).await?;
     let (b, run) = (&a.bucket, std::process::id());
     let mut rng = 0x9E37_79B9_7F4A_7C15u64 ^ (id as u64 + 1).wrapping_mul(0x2545_F491_4F6C_DD1D);
     let mut req = Vec::with_capacity(256 + a.size);
+    let body = bytes::Bytes::from(vec![b'x'; a.size]);
     tokio::time::sleep_until(t0.into()).await;
     let mut i = 0usize;
     while Instant::now() < end {
         let start = Instant::now();
         req.clear();
         let mut conflict = false;
-        let status = if a.op == Op::Cas {
+        let status = if let Some(s) = store {
+            match a.op {
+                Op::Create => drop(s.create(&format!("load/create-{run}/s{id}-{i}"), body.clone()).await?),
+                _ => drop(s.get(&format!("load/get/k{:05}", (id * 7919 + i) % GET_KEYS)).await?.context("missing")?),
+            }
+            200
+        } else if a.op == Op::Cas {
             let path = format!("/{b}/load/cas");
             request(&mut req, "GET", host, &path, "", 0);
             c.send(&req).await?;

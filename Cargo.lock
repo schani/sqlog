@@ -1931,6 +1931,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "aws-lc-rs",
  "axum",
  "base64 0.22.1",
  "bytes",
@@ -1951,9 +1952,11 @@ dependencies = [
  "serde_bytes",
  "serde_json",
  "tokio",
+ "tokio-rustls",
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "webpki-roots",
  "xxhash-rust",
  "zstd",
 ]
