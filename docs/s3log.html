@@ -103,7 +103,7 @@
 <p class="lede">A command queue and effect log kept entirely in one S3 bucket.</p>
 
 <h2 style="border:0;padding-top:0;margin-top:20px">What it's for</h2>
-<p>A database whose only durable state is an S3 bucket. Clients submit commands (transactions). Every replica must execute the same commands in the same order; no command may run twice, and every command a client was told is accepted must run. Clients learn each command's result.</p>
+<p>A database whose only durable state is two logs in an S3 bucket: a command log and an effect log. Clients submit commands (transactions). Commands take effect in one order that everyone agrees on; no command may run twice, and every command a client was told is accepted must run. Clients learn each command's result.</p>
 <p>There is no server to coordinate, and no locks. Any number of writers and producers work at once, and any of them may stop at any time.</p>
 
 <h2>How it works</h2>
@@ -111,7 +111,7 @@
   <li><strong>Writers</strong> put each command in the bucket as its own object, <code>cmd/&lt;name&gt;</code>. The name is a UUIDv7, so names sort by time.</li>
   <li><strong>The watermark</strong> is one object holding a name: commands up to it are <em>closed</em>. Producers raise it to <em>now&nbsp;&minus;&nbsp;lag</em>, leaving in-flight PUTs time to land. A writer whose name is still above the watermark after its PUT is told <strong>acked</strong>: its command will run.</li>
   <li><strong>Producers</strong> take the closed commands not yet executed, in name order, execute them, and publish the results as the next effect: <code>fx/a1</code>, <code>fx/a2</code>, &hellip; The PUT is create-only (<code>If-None-Match: *</code>), so the first producer to write effect <em>n</em> wins. There is one history.</li>
-  <li><strong>Readers</strong> (every replica) read the effects in order and re-execute them. That is how clients get results.</li>
+  <li><strong>Readers</strong> read the effect log in order. An effect holds its commands' results and the changes they made, so reading it executes nothing. That is how clients get results.</li>
 </ul>
 
 <div class="panel diagram" aria-label="Diagram: writers create cmd objects; producers read closed commands and create numbered effects; readers read effects">
@@ -128,7 +128,7 @@
   <text x="70" y="82" text-anchor="middle" class="s">submit commands</text>
   <rect x="8" y="178" width="124" height="54" rx="8" fill="var(--soft)" stroke="var(--line)"/>
   <text x="70" y="201" text-anchor="middle" style="font-weight:600">Readers</text>
-  <text x="70" y="220" text-anchor="middle" class="s">every replica</text>
+  <text x="70" y="220" text-anchor="middle" class="s">read in order</text>
   <rect x="628" y="40" width="124" height="192" rx="8" fill="var(--soft)" stroke="var(--line)"/>
   <text x="690" y="128" text-anchor="middle" style="font-weight:600">Producers</text>
   <text x="690" y="147" text-anchor="middle" class="s">execute, publish</text>
@@ -228,7 +228,7 @@
     </ol>
     <h3>Reader</h3>
     <ol>
-      <li>GET <code>fx/&lt;next&gt;</code> until 404; re-execute each effect's commands.</li>
+      <li>GET <code>fx/&lt;next&gt;</code> until 404; apply each effect's changes and hand out its results.</li>
       <li>Outcome: <strong>ran</strong> if an effect contains the name; <strong>dead</strong> if an effect's <code>last</code> passed it without it.</li>
     </ol>
   </div>
@@ -321,10 +321,10 @@ const PATCHES = [
 
   { title: "Readers apply fx/a1; A and B get results",
     clock: "08:00:03.3",
-    act: { R: "Applied fx/a1 (re-executed A, B). fx/a2: 404. Next effect: fx/a2.",
+    act: { R: "Applied fx/a1 (results of A, B). fx/a2: 404. Next effect: fx/a2.",
            A: "Told: acked. Result: rA (fx/a1).", B: "Told: acked. Result: rB (fx/a1)." },
     reqs: [["R", "GET fx/a1  → last = 0801.5-B, ran [0801-A → rA, 0801.5-B → rB]"], ["R", "GET fx/a2  → 404"]],
-    text: `<p>Every replica reads effects in order and re-executes their commands, reaching the same state. A and B wait on a replica, which hands them their results.</p>
+    text: `<p>R reads <code>fx/a1</code>: it holds the results of A and B and the changes they made. Anyone reading the effect log in order sees the same state. A and B get their results from it.</p>
            <p>The cycle repeats: new commands, a higher watermark, <code>fx/a2</code>.</p>` },
 ];
 
