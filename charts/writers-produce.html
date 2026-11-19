@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>s3log: writers that produce</title>
+<style>
+.viz-root{color-scheme:light;--surface-0:#f5f4f1;--surface-1:#fcfcfb;--grid:#e6e4df;--text-primary:#0b0b0b;--text-secondary:#52514e;--text-muted:#7a7974;--tip-bg:#fff;--tip-border:#dcdad4;--dnf:#e3e1db;--accent:#eb6834;
+--s0:#cde2fb;--s1:#b7d3f6;--s2:#9ec5f4;--s3:#86b6ef;--s4:#6da7ec;--s5:#5598e7;--s6:#3987e5;--s7:#2a78d6;--s8:#256abf;--s9:#1c5cab;--s10:#184f95;--s11:#104281;--s12:#0d366b;
+--l1:#86b6ef;--l2:#5598e7;--l3:#2a78d6;--l4:#1c5cab;--l5:#104281}
+@media (prefers-color-scheme:dark){:root:where(:not([data-theme="light"])) .viz-root{color-scheme:dark;--surface-0:#121211;--surface-1:#1a1a19;--grid:#2e2e2c;--text-primary:#f0efec;--text-secondary:#c3c2b7;--text-muted:#8f8e86;--tip-bg:#232322;--tip-border:#3a3a37;--dnf:#2a2a28;--accent:#d95926;
+--s0:#1d2a3a;--s1:#1b3350;--s2:#183d66;--s3:#184f95;--s4:#1c5cab;--s5:#256abf;--s6:#2a78d6;--s7:#3987e5;--s8:#5598e7;--s9:#6da7ec;--s10:#86b6ef;--s11:#9ec5f4;--s12:#b7d3f6;
+--l1:#184f95;--l2:#256abf;--l3:#3987e5;--l4:#6da7ec;--l5:#9ec5f4}}
+*{box-sizing:border-box}body{margin:0}
+.viz-root{background:var(--surface-0);color:var(--text-primary);font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;min-height:100vh}
+main{max-width:1100px;margin:0 auto;padding:32px 20px 64px}
+h1{font-size:1.6rem;margin:0 0 4px}h2.sec{font-size:1.15rem;margin:28px 0 8px}
+.lead{color:var(--text-secondary);margin:0 0 16px;max-width:860px}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}@media (max-width:900px){.grid{grid-template-columns:1fr}}
+.card{background:var(--surface-1);border-radius:10px;padding:16px;position:relative}
+.card.wide{grid-column:1/-1}
+.card h2{font-size:1rem;margin:0}.card .sub{color:var(--text-secondary);font-size:.84rem;margin:2px 0 10px}
+.hm{display:grid;gap:2px;font-variant-numeric:tabular-nums}
+.hm .lbl{font-size:11px;color:var(--text-muted);display:flex;align-items:center}
+.hm .col{justify-content:center}.hm .row{justify-content:flex-end;padding-right:8px;text-align:right;line-height:1.2}
+.hm .cell{height:40px;border-radius:4px;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:600;cursor:default}
+.hm .cell.dnf{background:repeating-linear-gradient(45deg,var(--dnf),var(--dnf) 4px,transparent 4px,transparent 8px);color:var(--text-muted);font-weight:500;outline:1px solid var(--grid)}
+.hm .axis{font-size:11px;color:var(--text-muted);text-align:center;grid-column:2/-1;padding-top:2px}
+.ramp{display:flex;align-items:center;gap:6px;font-size:11px;color:var(--text-muted);margin-top:8px}.ramp i{display:inline-block;width:14px;height:10px}
+svg.c{display:block;width:100%;height:auto;overflow:visible}svg text{font-family:inherit}
+.tick{fill:var(--text-muted);font-size:11px;font-variant-numeric:tabular-nums}.endlbl{fill:var(--text-secondary);font-size:10.5px;font-weight:600}
+.legend{display:flex;flex-wrap:wrap;gap:6px 16px;font-size:.84rem;color:var(--text-secondary);margin:0 0 8px}.legend span{display:inline-flex;align-items:center;gap:6px}.legend svg{width:18px;height:6px}
+.tip{position:fixed;pointer-events:none;background:var(--tip-bg);border:1px solid var(--tip-border);border-radius:6px;padding:6px 9px;font-size:12px;line-height:1.45;box-shadow:0 2px 10px rgba(0,0,0,.12);opacity:0;transition:opacity .08s;white-space:nowrap;z-index:5;color:var(--text-primary)}
+.tip .m{color:var(--text-muted)}
+.notes{color:var(--text-secondary);font-size:.9rem;max-width:900px}.notes li{margin:5px 0}
+details{margin-top:16px;background:var(--surface-1);border-radius:10px;padding:12px 16px}summary{cursor:pointer;font-weight:600}
+table.t{border-collapse:collapse;width:100%;font-size:.8rem;margin-top:8px;font-variant-numeric:tabular-nums}table.t th,table.t td{padding:4px 7px;text-align:right;border-bottom:1px solid var(--grid)}table.t th{color:var(--text-secondary)}
+</style>
+</head>
+<body class="viz-root">
+<main><p style="margin:0 0 12px;font-size:.9rem"><a href="../" style="color:inherit;opacity:.7">← s3log</a></p>
+<h1>s3log: writers that produce, instead of fixed producers</h1>
+<p class="lead">Can writers take turns producing, so that no dedicated producer process is needed? Rows are strategies; the first two are the extremes from the producer matrix.</p>
+<div class="grid" id="charts"></div>
+<h2 class="sec">What it shows</h2>
+<ul class="notes"><li><b>No fixed producers:</b> after its PUT, a writer waits; if no new effect appeared meanwhile, it runs a producer cycle itself. With a <i>fixed</i> random wait, many writers' waits expire during one producer's cycle, so they all produce: up to 500 of 500 writers, fetching each command up to 340 times. Throughput collapses from 500 writers on.</li>
+<li><b>Adaptive:</b> the wait is 2–3× the average gap between effects the writer has seen, within the bounds shown, and a writer also stays out if the watermark moved (producers raise it every cycle). Up to 1,000 writers only 3–13 writers produce and each command is fetched 1.0–1.5 times; 871 commands/s at 1,000 writers.</li>
+<li><b>But the wait sets its own pace:</b> a writer produces only after a stall, runs one cycle and waits again, so effects arrive about once per wait (0.5–1 s) and every command waits about that long. One fixed producer runs cycles back to back: 3,482 commands/s at 1,000 writers.</li>
+<li><b>From 2,000 writers on it collapses anyway:</b> to be able to produce, every writer reads every effect (up to 16 effect GETs per command), the bench process saturates, cycles slow down, and waits expire mid-cycle again (170 writers produced at 4,000).</li>
+<li>Same setup as the producer matrix: s3log-bench against s3-mem with the lean client, one 2-core VM, closed-loop writers, lag 200 ms, 10 s per run, capped at 4 minutes. Every finished run passed all protocol checks.</li></ul>
+<details><summary>Table: every run</summary><div id="table"></div></details>
+</main>
+<div class="tip" id="tip"></div>
+<script>
+const D = [{"row": "fixed1", "writers": 100, "finished": true, "cps": 364.8, "result_p50": 257.063545, "get_cmd": 1.0, "produced": 1, "bench_cores": 0.05, "server_cores": 0.04, "passed": true}, {"row": "fixed1", "writers": 500, "finished": true, "cps": 1768.9, "result_p50": 259.686613, "get_cmd": 1.0, "produced": 1, "bench_cores": 0.18, "server_cores": 0.13, "passed": true}, {"row": "fixed1", "writers": 1000, "finished": true, "cps": 3481.6, "result_p50": 264.902841, "get_cmd": 1.0, "produced": 1, "bench_cores": 0.35, "server_cores": 0.25, "passed": true}, {"row": "fixed1", "writers": 2000, "finished": true, "cps": 6699.7, "result_p50": 268.34524999999996, "get_cmd": 1.0, "produced": 1, "bench_cores": 0.68, "server_cores": 0.41, "passed": true}, {"row": "fixed1", "writers": 4000, "finished": true, "cps": 10405.2, "result_p50": 344.786121, "get_cmd": 1.0, "produced": 1, "bench_cores": 1.01, "server_cores": 0.53, "passed": true}, {"row": "every", "writers": 100, "finished": true, "cps": 372.1, "result_p50": 248.477961, "get_cmd": 14.32, "produced": 100, "bench_cores": 0.53, "server_cores": 0.46, "passed": true}, {"row": "every", "writers": 500, "finished": true, "cps": 59.8, "result_p50": 8592.997979, "get_cmd": 502.56, "produced": 500, "bench_cores": 1.12, "server_cores": 0.8, "passed": true}, {"row": "every", "writers": 1000, "finished": false}, {"row": "every", "writers": 2000, "finished": false}, {"row": "every", "writers": 4000, "finished": false}, {"row": "w25-75", "writers": 100, "finished": true, "cps": 350, "result_p50": 254.846621, "get_cmd": 4.06, "produced": 99, "bench_cores": 0.29, "server_cores": 0.21, "passed": true}, {"row": "w25-75", "writers": 500, "finished": true, "cps": 96, "result_p50": 4429.828232, "get_cmd": 340.26, "produced": 500, "bench_cores": 0.98, "server_cores": 0.85, "passed": true}, {"row": "w25-75", "writers": 1000, "finished": true, "cps": 73, "result_p50": 13635.683853, "get_cmd": 80.57, "produced": 25, "bench_cores": 1.53, "server_cores": 0.29, "passed": true}, {"row": "w25-75", "writers": 2000, "finished": true, "cps": 147, "result_p50": 13426.213121, "get_cmd": 48.43, "produced": 18, "bench_cores": 1.42, "server_cores": 0.3, "passed": true}, {"row": "w25-75", "writers": 4000, "finished": true, "cps": 217, "result_p50": 1221.705941, "get_cmd": 57.56, "produced": 68, "bench_cores": 1.21, "server_cores": 0.37, "passed": true}, {"row": "w100-300", "writers": 100, "finished": true, "cps": 229, "result_p50": 411.97373799999997, "get_cmd": 1.81, "produced": 40, "bench_cores": 0.13, "server_cores": 0.09, "passed": true}, {"row": "w100-300", "writers": 500, "finished": true, "cps": 129, "result_p50": 3909.500252, "get_cmd": 258.62, "produced": 500, "bench_cores": 0.98, "server_cores": 0.82, "passed": true}, {"row": "w100-300", "writers": 1000, "finished": true, "cps": 112, "result_p50": 667.414278, "get_cmd": 58.5, "produced": 4, "bench_cores": 1.5, "server_cores": 0.32, "passed": true}, {"row": "w100-300", "writers": 2000, "finished": true, "cps": 143, "result_p50": 13600.435028, "get_cmd": 42.07, "produced": 10, "bench_cores": 1.36, "server_cores": 0.29, "passed": true}, {"row": "w100-300", "writers": 4000, "finished": true, "cps": 147, "result_p50": 11884.983005, "get_cmd": 139.01, "produced": 186, "bench_cores": 1.17, "server_cores": 0.47, "passed": true}, {"row": "w300-900", "writers": 100, "finished": true, "cps": 114, "result_p50": 800.938721, "get_cmd": 1.39, "produced": 10, "bench_cores": 0.05, "server_cores": 0.04, "passed": true}, {"row": "w300-900", "writers": 500, "finished": true, "cps": 541, "result_p50": 781.6013280000001, "get_cmd": 7.99, "produced": 104, "bench_cores": 0.42, "server_cores": 0.19, "passed": true}, {"row": "w300-900", "writers": 1000, "finished": true, "cps": 75, "result_p50": null, "get_cmd": 81.64, "produced": 2, "bench_cores": 1.14, "server_cores": 0.25, "passed": true}, {"row": "w300-900", "writers": 2000, "finished": true, "cps": 188, "result_p50": 1702.289323, "get_cmd": 46.42, "produced": 32, "bench_cores": 0.95, "server_cores": 0.34, "passed": true}, {"row": "w300-900", "writers": 4000, "finished": true, "cps": 241, "result_p50": null, "get_cmd": 15.31, "produced": 2, "bench_cores": 0.85, "server_cores": 0.21, "passed": true}, {"row": "w1000-3000", "writers": 100, "finished": true, "cps": 34, "result_p50": 2385.383986, "get_cmd": 1.0, "produced": 2, "bench_cores": 0.01, "server_cores": 0.01, "passed": true}, {"row": "w1000-3000", "writers": 500, "finished": true, "cps": 177, "result_p50": 2290.916247, "get_cmd": 4.01, "produced": 19, "bench_cores": 0.11, "server_cores": 0.05, "passed": true}, {"row": "w1000-3000", "writers": 1000, "finished": true, "cps": 95, "result_p50": 2988.581377, "get_cmd": 161.31, "produced": 139, "bench_cores": 0.85, "server_cores": 0.35, "passed": true}, {"row": "w1000-3000", "writers": 2000, "finished": true, "cps": 196, "result_p50": 2853.552619, "get_cmd": 37.15, "produced": 31, "bench_cores": 0.88, "server_cores": 0.28, "passed": true}, {"row": "w1000-3000", "writers": 4000, "finished": true, "cps": 222, "result_p50": 3113.796593, "get_cmd": 33.21, "produced": 42, "bench_cores": 0.83, "server_cores": 0.26, "passed": true}, {"row": "a50-5000", "writers": 100, "finished": true, "cps": 53, "result_p50": 936.2013420000001, "get_cmd": 1.0, "produced": 3, "bench_cores": 0.02, "server_cores": 0.01, "passed": true}, {"row": "a50-5000", "writers": 500, "finished": true, "cps": 234, "result_p50": 1222.908778, "get_cmd": 1.0, "produced": 3, "bench_cores": 0.11, "server_cores": 0.04, "passed": true}, {"row": "a50-5000", "writers": 1000, "finished": true, "cps": 478, "result_p50": 1505.952969, "get_cmd": 1.52, "produced": 13, "bench_cores": 0.34, "server_cores": 0.08, "passed": true}, {"row": "a50-5000", "writers": 2000, "finished": true, "cps": 303, "result_p50": 3722.784849, "get_cmd": 6.97, "produced": 43, "bench_cores": 0.43, "server_cores": 0.1, "passed": true}, {"row": "a50-5000", "writers": 4000, "finished": false}, {"row": "a20-1000", "writers": 100, "finished": true, "cps": 91, "result_p50": 1002.501692, "get_cmd": 1.0, "produced": 3, "bench_cores": 0.03, "server_cores": 0.02, "passed": true}, {"row": "a20-1000", "writers": 500, "finished": true, "cps": 442, "result_p50": 1003.189056, "get_cmd": 1.0, "produced": 4, "bench_cores": 0.24, "server_cores": 0.08, "passed": true}, {"row": "a20-1000", "writers": 1000, "finished": true, "cps": 871, "result_p50": 1008.39601, "get_cmd": 1.18, "produced": 9, "bench_cores": 0.75, "server_cores": 0.16, "passed": true}, {"row": "a20-1000", "writers": 2000, "finished": true, "cps": 622, "result_p50": 2900.679855, "get_cmd": 6.0, "produced": 36, "bench_cores": 1.08, "server_cores": 0.22, "passed": true}, {"row": "a20-1000", "writers": 4000, "finished": true, "cps": 326, "result_p50": 8764.857963, "get_cmd": 33.33, "produced": 170, "bench_cores": 1.08, "server_cores": 0.35, "passed": true}];
+const LABELS = { fixed1: "1 fixed producer", every: "every writer produces", "w25-75": "wait 25–75 ms", "w100-300": "wait 100–300 ms", "w300-900": "wait 300–900 ms", "w1000-3000": "wait 1–3 s", "a20-1000": "adaptive, 20 ms–1 s", "a50-5000": "adaptive, 50 ms–5 s" };
+const ROWS = Object.keys(LABELS), W = [100, 500, 1000, 2000, 4000];
+const rowName = p => LABELS[p];
+const fmt = v => v == null ? "–" : v >= 10000 ? (v / 1000).toFixed(v >= 100000 ? 0 : 1).replace(/\.0$/, "") + "k" : v >= 100 ? Math.round(v).toLocaleString("en-US") : v >= 10 ? (+v.toFixed(0)).toString() : (+v.toFixed(1)).toString();
+const fx = v => v >= 1000 && v % 1000 === 0 ? (v / 1000) + "k" : v.toLocaleString("en-US");
+const tip = document.getElementById("tip");
+function showTip(ev, html) { tip.innerHTML = html; tip.style.opacity = 1; const w = tip.offsetWidth; let x = ev.clientX + 14; if (x + w > innerWidth - 8) x = ev.clientX - w - 14; tip.style.left = x + "px"; tip.style.top = (ev.clientY + 14) + "px"; }
+const hideTip = () => tip.style.opacity = 0;
+const run = (lag, p, w) => D.find(r => r.row === p && r.writers === w);
+const details = r => !r.finished ? `<b>${rowName(r.row)}, ${fx(r.writers)} writers</b><div class="m">did not finish within 4 minutes</div>` :
+  `<b>${rowName(r.row)}, ${fx(r.writers)} writers</b><div>${fmt(r.cps)} cmd/s · p50 ${r.result_p50 == null ? "no results in time" : fmt(r.result_p50) + " ms"}</div><div class="m">${fmt(r.produced)} writers produced · ${fmt(r.get_cmd || 0)} command GETs per command</div><div class="m">bench ${r.bench_cores} + s3-mem ${r.server_cores} cores${r.passed ? "" : " · CHECKS FAILED"}</div>`;
+
+function heatmap({ title, sub, lag, value, log, unit, lowGood, wide }) {
+  const card = document.createElement("div"); card.className = "card" + (wide ? " wide" : "");
+  const vals = D.filter(r => r.finished).map(r => value(r)).filter(v => v > 0);
+  const lo = Math.min(...vals), hi = Math.max(...vals), t = v => log ? (Math.log(v) - Math.log(lo)) / ((Math.log(hi) - Math.log(lo)) || 1) : (v - lo) / ((hi - lo) || 1);
+  let h = `<h2>${title}</h2><div class="sub">${sub}</div><div class="hm" style="grid-template-columns:150px repeat(${W.length},1fr)">`;
+  h += `<div></div>` + W.map(w => `<div class="lbl col">${fx(w)}</div>`).join("");
+  for (const p of ROWS) {
+    h += `<div class="lbl row">${rowName(p)}</div>`;
+    for (const w of W) {
+      const r = run(lag, p, w);
+      if (!r) { h += `<div class="cell dnf">–</div>`; continue; }
+      if (!r.finished) { h += `<div class="cell dnf" data-k="${lag}|${p}|${w}">DNF</div>`; continue; }
+      const v = value(r);
+      if (v == null) { h += `<div class="cell dnf" data-k="${lag}|${p}|${w}">none</div>`; continue; }
+      const step = Math.max(0, Math.min(12, Math.round(t(v) * 12)));
+      const ink = getComputedStyle(document.body).colorScheme === "dark" ? (step >= 9 ? "#0b0b0b" : "#f0efec") : (step >= 7 ? "#ffffff" : "#0b0b0b");
+      h += `<div class="cell" data-k="${lag}|${p}|${w}" style="background:var(--s${step});color:${ink}">${fmt(v)}${r.passed ? "" : "!"}</div>`;
+    }
+  }
+  h += `<div class="axis">writers</div></div>`;
+  h += `<div class="ramp">${fmt(lo)}${unit ? " " + unit : ""} ${[0, 2, 4, 6, 8, 10, 12].map(s => `<i style="background:var(--s${s})"></i>`).join("")} ${fmt(hi)}${unit ? " " + unit : ""}${log ? " (log scale)" : ""}${lowGood ? " · lower is better" : ""}</div>`;
+  card.innerHTML = h;
+  card.querySelectorAll("[data-k]").forEach(c => { const [l, p, w] = c.dataset.k.split("|"); const r = run(+l, p, +w); c.addEventListener("mousemove", ev => showTip(ev, details(r))); c.addEventListener("mouseleave", hideTip); });
+  document.getElementById("charts").appendChild(card);
+}
+
+function lines({ title, sub, lag, unit, value, wide }) {
+  const card = document.createElement("div"); card.className = "card" + (wide ? " wide" : "");
+  const S = ROWS.map((p, i) => ({ p, name: rowName(p), color: p === "every" ? "var(--accent)" : `var(--l${i + 1})`, dash: p === "every" }));
+  const key = s => `<svg viewBox="0 0 18 6"><line x1="1" y1="3" x2="17" y2="3" stroke="${s.color}" stroke-width="2" stroke-linecap="round" ${s.dash ? 'stroke-dasharray="4 3"' : ""}/></svg>`;
+  card.innerHTML = `<h2>${title}</h2><div class="sub">${sub}</div><div class="legend">${S.map(s => `<span>${key(s)}${s.name}</span>`).join("")}</div>`;
+  const Wd = wide ? 900 : 480, H = 280, L = 52, R = 70, T = 10, B = 34, pw = Wd - L - R, ph = H - T - B;
+  const ys_ = D.filter(r => r.lag === lag && r.finished).map(value);
+  const max = Math.max(...ys_), raw = max / 4, mag = 10 ** Math.floor(Math.log10(raw)), step = [1, 2, 2.5, 5, 10].map(m => m * mag).find(s => s >= raw), top = Math.ceil(max * 1.06 / step) * step;
+  const xs = i => L + i * pw / (W.length - 1), ys = v => T + ph - v / top * ph;
+  let svg = `<svg class="c" viewBox="0 0 ${Wd} ${H}">`;
+  for (let v = 0; v <= top + 1e-9; v += step) svg += `<line x1="${L}" x2="${L + pw}" y1="${ys(v)}" y2="${ys(v)}" stroke="var(--grid)"/><text class="tick" x="${L - 6}" y="${ys(v) + 3.5}" text-anchor="end">${fmt(v)}</text>`;
+  W.forEach((w, i) => svg += `<text class="tick" x="${xs(i)}" y="${T + ph + 16}" text-anchor="middle">${fx(w)}</text>`);
+  svg += `<text class="tick" x="${L + pw / 2}" y="${H - 2}" text-anchor="middle">writers</text>`;
+  const ends = [];
+  for (const s of S) {
+    const p = W.map((w, i) => { const r = run(lag, s.p, w); return r && r.finished ? [xs(i), ys(value(r)), value(r), r] : null; }).filter(Boolean);
+    if (!p.length) continue;
+    svg += `<polyline fill="none" stroke="${s.color}" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" ${s.dash ? 'stroke-dasharray="5 4"' : ""} points="${p.map(q => q[0] + "," + q[1]).join(" ")}"/>`;
+    p.forEach(([cx, cy, , r]) => svg += `<circle data-k="${lag}|${s.p}|${r.writers}" cx="${cx}" cy="${cy}" r="5" fill="${s.color}" stroke="var(--surface-1)" stroke-width="2"/>`);
+    const last = p.at(-1); ends.push({ x: last[0], y: last[1], v: last[2] });
+  }
+  ends.sort((a, b) => a.y - b.y); let prev = -99;
+  for (const e of ends) if (e.y - prev >= 12) { svg += `<text class="endlbl" x="${e.x + 9}" y="${e.y + 4}">${fmt(e.v)}</text>`; prev = e.y; }
+  card.insertAdjacentHTML("beforeend", svg + `</svg>`);
+  card.querySelectorAll("circle[data-k]").forEach(c => { const [l, p, w] = c.dataset.k.split("|"); const r = run(+l, p, +w); c.addEventListener("mousemove", ev => showTip(ev, details(r))); c.addEventListener("mouseleave", hideTip); });
+  document.getElementById("charts").appendChild(card);
+}
+
+
+heatmap({ title: "Throughput", sub: "Commands effected per second, lag 200 ms. Hover a cell for details.", lag: 200, value: r => r.cps, unit: "cmd/s", log: true, wide: true });
+heatmap({ title: "Submit to result (p50)", sub: "A writer's wait from submit until its result. \u201cnone\u201d: no writer got a result before its 11 s timeout.", lag: 200, value: r => r.result_p50, unit: "ms", log: true, lowGood: true });
+heatmap({ title: "Writers that produced", sub: "How many writers ran at least one producer cycle.", lag: 200, value: r => r.produced, log: true, lowGood: true });
+heatmap({ title: "Command GETs per command", sub: "Each producing writer fetches the commands it lists: duplicate producing shows up here.", lag: 200, value: r => r.get_cmd, log: true, lowGood: true });
+heatmap({ title: "CPU used, bench + s3-mem", sub: "Cores used by both processes. The VM has 2.", lag: 200, value: r => r.bench_cores + r.server_cores, unit: "cores" });
+
+
+const cols = [["row", "setting"], ["writers", "writers"], ["cps", "cmd/s"], ["result_p50", "p50 ms"], ["produced", "writers produced"], ["get_cmd", "GET cmd/cmd"], ["bench_cores", "bench cores"], ["server_cores", "s3-mem cores"]];
+document.getElementById("table").innerHTML = `<table class="t"><tr>${cols.map(c => `<th>${c[1]}</th>`).join("")}<th>checks</th></tr>${D.map(r => `<tr>${cols.map(([k]) => `<td>${k === "row" ? rowName(r.row) : r.finished || k === "writers" ? (typeof r[k] === "number" ? fmt(r[k]) : (r[k] ?? "–")) : "–"}</td>`).join("")}<td>${!r.finished ? "did not finish" : r.passed ? "pass" : "FAIL"}</td></tr>`).join("")}</table>`;
+</script>
+</body>
+</html>

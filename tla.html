@@ -1,0 +1,254 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>S3Log.tla, annotated</title><style>:root{--bg:#fbfaf7;--fg:#1f2328;--code:#f3f1ec;--border:#e2ded5;--k:#8250df;--o:#cf222e;--c:#6e7781;--s:#0a6b3d;--d:#0550ae;--accent:#0550ae}
+@media (prefers-color-scheme:dark){:root{--bg:#15171a;--fg:#e6e6e6;--code:#1e2126;--border:#30353c;--k:#c297ff;--o:#ff8182;--c:#8b949e;--s:#7ee2a8;--d:#79c0ff;--accent:#79c0ff}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif}
+main{max-width:860px;margin:0 auto;padding:40px 24px 80px}h1{font-size:2rem;margin:0 0 .4em}h2{font-size:1.35rem;margin:2.2em 0 .6em;padding-top:.6em;border-top:1px solid var(--border)}
+a{color:var(--accent)}code{font:.88em/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;background:var(--code);padding:.1em .35em;border-radius:4px}
+pre{background:var(--code);border:1px solid var(--border);border-left:4px solid var(--accent);border-radius:6px;padding:14px 16px;overflow-x:auto}pre code{background:none;padding:0;font-size:14px}
+table{border-collapse:collapse;width:100%;margin:1em 0;font-size:.95em}th,td{border:1px solid var(--border);padding:6px 10px;text-align:left;vertical-align:top}th{background:var(--code)}hr{border:0;border-top:1px solid var(--border);margin:2em 0}
+.k{color:var(--k);font-weight:600}.o{color:var(--o)}.c{color:var(--c);font-style:italic}.s{color:var(--s)}.d{color:var(--d);font-weight:600}</style></head><body><main><p><a href="./">← s3log</a></p><h1>S3Log.tla, annotated</h1>
+<p>The spec in <a href="tla/S3Log.tla">S3Log.tla</a>, block by block. Code is verbatim; text after each block explains it.</p>
+<h2 id="tla-in-five-lines">TLA+ in five lines</h2>
+<ul>
+<li>A spec describes <strong>states</strong> (values of variables) and <strong>steps</strong> (pairs of states).</li>
+<li>An <strong>action</strong> is a formula about one step. <code>x</code> is the value before, <code>x'</code> the value after.</li>
+<li><code>/\</code> is "and", <code>\/</code> is "or". A bulleted list of <code>/\</code> or <code>\/</code> lines is one big and/or; indentation groups them.</li>
+<li>A line without a primed variable is a <strong>guard</strong>: the action can only happen when it holds.</li>
+<li><code>UNCHANGED &lt;&lt;a, b&gt;&gt;</code> means <code>a' = a /\ b' = b</code>. Every action must say what happens to every variable.</li>
+</ul>
+<p>TLC, the model checker, starts from every initial state and explores every possible step, in every order, until it has seen every reachable state. It checks the invariants in each one.</p>
+<hr />
+<pre><code><span class="c">-------------------------------- MODULE S3Log --------------------------------</span>
+<span class="c">(* Commands as S3 objects, a watermark object and an effect log of S3 objects.</span>
+<span class="c">   Command names are 1..N, standing for UUIDv7 names in key order. *)</span>
+<span class="k">EXTENDS</span> Naturals, Sequences</code></pre>
+<ul>
+<li>The module name must match the file name.</li>
+<li><code>(* ... *)</code> is a comment.</li>
+<li><code>EXTENDS</code> imports standard modules: <code>Naturals</code> for numbers and <code>..</code>, <code>Sequences</code> for <code>Len</code> and <code>Append</code>.</li>
+</ul>
+<h2 id="what-it-assumes-about-s3">What it assumes about S3</h2>
+<ul>
+<li>A conditional PUT on one key is atomic: of two racing <code>If-None-Match: *</code> PUTs, one wins; <code>If-Match</code> loses no updates.</li>
+<li>Reads and writes of one key are linearizable: each takes effect at one instant between request and response, so once any client has read a value, no later read returns an older one. This covers the watermark while a raise is still in flight. AWS documents only read-after-write consistency; linearizability during an in-flight write is assumed, not documented.</li>
+<li>A LIST started after a PUT succeeded includes that key.</li>
+</ul>
+<h2 id="constants">Constants</h2>
+<pre><code><span class="k">CONSTANTS</span> N, Producers</code></pre>
+<p>Parameters, fixed per run, set in <a href="#the-config">S3Log.cfg</a>:</p>
+<ul>
+<li><code>N</code>: how many command names exist. Names are the numbers <code>1..N</code>. A real name is a UUIDv7; only its order matters, so a number stands in for it.</li>
+<li><code>Producers</code>: a set of producer identities, e.g. <code>{p1, p2}</code>. Writers need no identity: each command name is its own writer.</li>
+</ul>
+<h2 id="variables">Variables</h2>
+<pre><code><span class="k">VARIABLES</span>
+    files,      <span class="c">\* command objects in the bucket</span>
+    acked,      <span class="c">\* commands whose writer was told they will be effected</span>
+    wm,         <span class="c">\* the watermark object</span>
+    effects,    <span class="c">\* the effect objects, in order</span>
+    prod        <span class="c">\* each producer's local state</span>
+
+vars <span class="o">==</span> &lt;&lt;files, acked, wm, effects, prod&gt;&gt;</code></pre>
+<p><code>\*</code> starts a line comment.</p>
+<table>
+<thead>
+<tr>
+<th>Variable</th>
+<th>Type</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>files</code></td>
+<td>set of names</td>
+<td>Command objects that exist in S3. Only ever grows (no deletes in this model).</td>
+</tr>
+<tr>
+<td><code>acked</code></td>
+<td>set of names</td>
+<td>Commands whose writer passed the second check. Not stored in S3; it is what writers know, kept so the invariants can talk about it.</td>
+</tr>
+<tr>
+<td><code>wm</code></td>
+<td>number</td>
+<td>The <code>watermark</code> object.</td>
+</tr>
+<tr>
+<td><code>effects</code></td>
+<td>sequence of records</td>
+<td><code>effect-1</code>, <code>effect-2</code>, …. Each is <code>[ran ↦ set of names, last ↦ number]</code>: the commands it ran and its <code>last_effected</code>. Pages and results are left out.</td>
+</tr>
+<tr>
+<td><code>prod</code></td>
+<td>function from producer to record</td>
+<td>Each producer's local memory; fields below.</td>
+</tr>
+</tbody>
+</table>
+<p><code>vars</code> is a tuple of all variables, used by the fairness conditions and <code>Spec</code>.</p>
+<h2 id="helpers">Helpers</h2>
+<pre><code><span class="d">Names</span> <span class="o">==</span> 1..N
+<span class="d">Last</span> <span class="o">==</span> effects[Len(effects)].last
+<span class="d">Effected</span> <span class="o">==</span> <span class="k">UNION</span> {effects[i].ran : i <span class="o">\in</span> 1..Len(effects)}</code></pre>
+<p><code>==</code> defines a name; it is not assignment.</p>
+<ul>
+<li><code>Names</code>: the set <code>{1, …, N}</code>.</li>
+<li><code>Last</code>: <code>last_effected</code> of the newest effect. Sequences are indexed from 1, so <code>effects[Len(effects)]</code> is the last element.</li>
+<li><code>Effected</code>: every command any effect ran. <code>{f(i) : i \in S}</code> builds a set; <code>UNION</code> merges a set of sets into one.</li>
+</ul>
+<h2 id="initial-state">Initial state</h2>
+<pre><code><span class="d">Init</span> <span class="o">==</span>
+    <span class="o">/\</span> files = {}
+    <span class="o">/\</span> acked = {}
+    <span class="o">/\</span> wm = 0
+    <span class="o">/\</span> effects = &lt;&lt;[ran <span class="o">|-&gt;</span> {}, last <span class="o">|-&gt;</span> 0]&gt;&gt;
+    <span class="o">/\</span> prod = [p <span class="o">\in</span> Producers <span class="o">|-&gt;</span> [pc <span class="o">|-&gt;</span> <span class="s">"idle"</span>, base <span class="o">|-&gt;</span> 0, wm <span class="o">|-&gt;</span> 0, cursor <span class="o">|-&gt;</span> 0, seen <span class="o">|-&gt;</span> {}]]</code></pre>
+<p>In <code>Init</code>, <code>=</code> fixes a variable's starting value.</p>
+<ul>
+<li>No commands, nothing acked, watermark 0.</li>
+<li><code>effects</code> starts with one dummy effect that ran nothing and has <code>last = 0</code>. This way <code>Last</code> always exists and no action needs a special case for an empty log. <code>&lt;&lt;a&gt;&gt;</code> is a one-element sequence; <code>[f |-&gt; v]</code> is a record.</li>
+<li><code>[p \in Producers |-&gt; …]</code> is a function: one record per producer. The fields are:<ul>
+<li><code>pc</code>: <code>"idle"</code> or <code>"scan"</code> (between <code>Read</code> and <code>Write</code>).</li>
+<li><code>base</code>: index of the effect it read; it will try to write <code>base + 1</code>.</li>
+<li><code>wm</code>: the watermark it read. A separate field from the global <code>wm</code>.</li>
+<li><code>cursor</code>: the last name it has listed.</li>
+<li><code>seen</code>: the names it found in the bucket.</li>
+</ul>
+</li>
+</ul>
+<h2 id="writers">Writers</h2>
+<pre><code><span class="c">\* A writer's PUT lands, whenever: before or after the writer gave up.</span>
+<span class="d">Put(n)</span> <span class="o">==</span>
+    <span class="o">/\</span> n <span class="o">\notin</span> files
+    <span class="o">/\</span> files<span class="o">'</span> = files <span class="o">\cup</span> {n}
+    <span class="o">/\</span> <span class="k">UNCHANGED</span> &lt;&lt;acked, wm, effects, prod&gt;&gt;</code></pre>
+<p><code>Put(n)</code> is an action with a parameter; <code>Next</code> below tries it for every name.</p>
+<ul>
+<li>Guard: <code>n</code> is not yet in the bucket. A name is written at most once (UUIDs are unique, and writers don't retry).</li>
+<li>Step: <code>n</code> appears in the bucket.</li>
+<li>Nothing ties this to the writer's progress. TLC may run <code>Put(n)</code> at any moment, which covers a PUT that lands long after the writer timed out.</li>
+<li>The first watermark check is not modelled. It only stops some writes from happening; allowing every write is a superset of behaviours, so whatever is safe here is safe with the check.</li>
+</ul>
+<pre><code><span class="c">\* After its PUT succeeded, the writer reads the watermark.</span>
+<span class="d">Ack(n)</span> <span class="o">==</span>
+    <span class="o">/\</span> n <span class="o">\in</span> files
+    <span class="o">/\</span> n &gt; wm
+    <span class="o">/\</span> acked<span class="o">'</span> = acked <span class="o">\cup</span> {n}
+    <span class="o">/\</span> <span class="k">UNCHANGED</span> &lt;&lt;files, wm, effects, prod&gt;&gt;</code></pre>
+<p>The second check.</p>
+<ul>
+<li>Guard 1: the PUT has landed. A writer only learns of success after that.</li>
+<li>Guard 2: the name is above the watermark at this moment.</li>
+<li>Step: the writer reports "will be effected".</li>
+<li>A writer that sees <code>n &lt;= wm</code> reports "unknown". The model needs no action for that: it is the same as never taking <code>Ack</code>.</li>
+<li>TLC may also run <code>Ack</code> long after <code>Put</code>, which covers a slow check.</li>
+</ul>
+<h2 id="the-watermark">The watermark</h2>
+<pre><code><span class="c">\* Anyone raises the watermark, by compare-and-set.</span>
+<span class="d">Raise</span> <span class="o">==</span>
+    <span class="o">/\</span> <span class="o">\E</span> w <span class="o">\in</span> wm + 1 .. N : wm<span class="o">'</span> = w
+    <span class="o">/\</span> <span class="k">UNCHANGED</span> &lt;&lt;files, acked, effects, prod&gt;&gt;</code></pre>
+<ul>
+<li><code>\E w \in S : P</code> is "for some <code>w</code> in <code>S</code>". Here it means the next <code>wm</code> is any value from <code>wm + 1</code> to <code>N</code>. TLC tries each.</li>
+<li>Because the raiser uses <code>If-Match</code>, read and write are one atomic step, so the watermark only grows. A raiser with a stale read gets 412 and nothing changes, which is a step the model doesn't need.</li>
+<li>"Any higher value" covers every raising policy: the newest name, now minus a lag, anything.</li>
+</ul>
+<h2 id="producers">Producers</h2>
+<pre><code><span class="c">\* A producer reads the latest effect and the watermark.</span>
+<span class="d">Read(p)</span> <span class="o">==</span>
+    <span class="o">/\</span> prod[p].pc = <span class="s">"idle"</span>
+    <span class="o">/\</span> Last &lt; wm
+    <span class="o">/\</span> prod<span class="o">'</span> = [prod <span class="k">EXCEPT</span> ![p] = [pc <span class="o">|-&gt;</span> <span class="s">"scan"</span>, base <span class="o">|-&gt;</span> Len(effects), wm <span class="o">|-&gt;</span> wm, cursor <span class="o">|-&gt;</span> Last, seen <span class="o">|-&gt;</span> {}]]
+    <span class="o">/\</span> <span class="k">UNCHANGED</span> &lt;&lt;files, acked, wm, effects&gt;&gt;</code></pre>
+<ul>
+<li>Guard 1: the producer is between cycles.</li>
+<li>Guard 2: there is work: the watermark is above <code>last_effected</code>. Without this, a producer could start a cycle with nothing to list and nothing to write, and be stuck.</li>
+<li><code>[prod EXCEPT ![p] = r]</code> is <code>prod</code> with <code>p</code>'s entry replaced by <code>r</code>; other producers are untouched.</li>
+<li>It records which effect it read (<code>base</code>), the watermark (<code>wm</code>), and starts listing after that effect's <code>last_effected</code> (<code>cursor</code>).</li>
+<li>Reading both in one step is a simplification. In S3 they are separate GETs, but a stale effect only makes the final conditional write fail, and <code>Last &lt;= wm</code> always holds, so the order doesn't matter.</li>
+</ul>
+<pre><code><span class="c">\* It lists the next name.</span>
+<span class="d">Scan(p)</span> <span class="o">==</span>
+    <span class="o">/\</span> prod[p].pc = <span class="s">"scan"</span>
+    <span class="o">/\</span> prod[p].cursor &lt; prod[p].wm
+    <span class="o">/\</span> <span class="k">LET</span> n <span class="o">==</span> prod[p].cursor + 1 <span class="k">IN</span>
+        prod<span class="o">'</span> = [prod <span class="k">EXCEPT</span> ![p].cursor = n,
+                             ![p].seen = <span class="k">IF</span> n <span class="o">\in</span> files <span class="k">THEN</span> @ <span class="o">\cup</span> {n} <span class="k">ELSE</span> @]
+    <span class="o">/\</span> <span class="k">UNCHANGED</span> &lt;&lt;files, acked, wm, effects&gt;&gt;</code></pre>
+<ul>
+<li>Guard: listing stops at the watermark this producer read, not the current one. This is the "LIST only after reading W, only up to W" rule.</li>
+<li><code>LET n == … IN</code> names a value for the formula after it.</li>
+<li><code>![p].cursor = n</code> updates one field of <code>p</code>'s record. <code>@</code> stands for the old value of that field.</li>
+<li>Step: advance the cursor by one name and, if that name is in the bucket now, add it to <code>seen</code>.</li>
+<li>One name per step is the finest possible pagination. Commands can land between any two steps, so this covers every way a paginated LIST can interleave with PUTs.</li>
+</ul>
+<pre><code><span class="c">\* It writes the next effect, if it found commands and no other producer has.</span>
+<span class="c">\* Finding none, it gives up once it has listed up to its watermark.</span>
+<span class="d">Write(p)</span> <span class="o">==</span>
+    <span class="o">/\</span> prod[p].pc = <span class="s">"scan"</span>
+    <span class="o">/\</span> prod[p].seen <span class="o">#</span> {} <span class="o">\/</span> prod[p].cursor = prod[p].wm
+    <span class="o">/\</span> effects<span class="o">'</span> = <span class="k">IF</span> Len(effects) = prod[p].base <span class="o">/\</span> prod[p].seen <span class="o">#</span> {}
+                  <span class="k">THEN</span> Append(effects, [ran <span class="o">|-&gt;</span> prod[p].seen, last <span class="o">|-&gt;</span> prod[p].cursor])
+                  <span class="k">ELSE</span> effects
+    <span class="o">/\</span> prod<span class="o">'</span> = [prod <span class="k">EXCEPT</span> ![p].pc = <span class="s">"idle"</span>]
+    <span class="o">/\</span> <span class="k">UNCHANGED</span> &lt;&lt;files, acked, wm&gt;&gt;</code></pre>
+<ul>
+<li>Guard: the producer has found at least one command, or has listed everything up to its watermark and found none.</li>
+<li>Having found a command, it may write after any number of further <code>Scan</code> steps: this is "the first N files".</li>
+<li>The effect is written only if it has commands, and only if <code>Len(effects) = base</code>. That is the conditional write: <code>effect-(base+1)</code> doesn't exist yet. The new effect records what was seen and the cursor as <code>last_effected</code>. If another producer won, nothing changes (412). If the producer found nothing, it writes nothing.</li>
+<li><code>last_effected</code> is the cursor, which may be past the last command found. The protocol uses the last command found instead. That is the case of a producer that writes right after reaching it, so the model includes it, and what holds here holds for the protocol.</li>
+<li>Either way the producer goes back to <code>idle</code> and may start over.</li>
+<li>Producer crashes are not modelled. A crashed producer is one that stops taking steps. An effect PUT that lands late is the same as a producer that paused before <code>Write</code>.</li>
+</ul>
+<h2 id="the-whole-system">The whole system</h2>
+<pre><code><span class="d">Producer(p)</span> <span class="o">==</span> Read(p) <span class="o">\/</span> Scan(p) <span class="o">\/</span> Write(p)
+
+<span class="d">Next</span> <span class="o">==</span>
+    <span class="o">\/</span> <span class="o">\E</span> n <span class="o">\in</span> Names : Put(n) <span class="o">\/</span> Ack(n)
+    <span class="o">\/</span> Raise
+    <span class="o">\/</span> <span class="o">\E</span> p <span class="o">\in</span> Producers : Producer(p)</code></pre>
+<p><code>Next</code> is every possible step: any writer, the watermark, or any producer. TLC branches on each.</p>
+<pre><code><span class="d">Spec</span> <span class="o">==</span> Init <span class="o">/\</span> <span class="o">[]</span>[Next]_vars <span class="o">/\</span> <span class="k">WF_vars</span>(Raise) <span class="o">/\</span> <span class="k">WF_vars</span>(Producer(<span class="k">CHOOSE</span> p <span class="o">\in</span> Producers : <span class="k">TRUE</span>))</code></pre>
+<ul>
+<li><code>Init</code>: start in an initial state.</li>
+<li><code>[][Next]_vars</code>: every step is a <code>Next</code> step or leaves all variables unchanged. Doing nothing is always allowed, so any process can stall at any point.</li>
+<li><code>WF_vars(A)</code> (weak fairness): if <code>A</code> stays possible forever, it eventually happens. This rules out runs where everything stalls forever, which only matters for <code>Picked</code>:<ul>
+<li>the watermark keeps rising until it reaches <code>N</code>. The protocol has to provide this: something must raise the watermark even when no new commands arrive, or the last acked command waits forever.</li>
+<li>one producer keeps working. <code>CHOOSE p \in Producers : TRUE</code> picks some fixed producer; which one doesn't matter, since they are interchangeable. The others get no fairness, so they may crash and stop forever at any point, including mid-scan.</li>
+</ul>
+</li>
+<li>Writers get no fairness: a writer may stop forever after any step.</li>
+</ul>
+<h2 id="properties">Properties</h2>
+<pre><code><span class="c">\* No command is effected twice.</span>
+<span class="d">AtMostOnce</span> <span class="o">==</span> <span class="o">\A</span> i, j <span class="o">\in</span> 1..Len(effects) : i <span class="o">#</span> j <span class="o">=&gt;</span> effects[i].ran <span class="o">\cap</span> effects[j].ran = {}</code></pre>
+<p><code>\A</code> is "for all", <code>#</code> is "not equal", <code>=&gt;</code> is "implies". No two effects share a command. This is the conditional effect write at work.</p>
+<pre><code><span class="c">\* The effects never pass an acked command without running it.</span>
+<span class="d">NoSkip</span> <span class="o">==</span> <span class="o">\A</span> n <span class="o">\in</span> acked : n &lt;= Last <span class="o">=&gt;</span> n <span class="o">\in</span> Effected</code></pre>
+<p>The core safety property. Once <code>last_effected</code> is at or above an acked name, that command is in some effect. It holds because:</p>
+<ol>
+<li>The writer's PUT landed before its check saw <code>n &gt; wm</code>.</li>
+<li>A producer lists <code>n</code> only if it read a watermark <code>&gt;= n</code>, so after that check, so after the PUT.</li>
+<li><code>last_effected</code> advances only through names the producer listed.</li>
+</ol>
+<pre><code><span class="c">\* Every acked command is effected eventually.</span>
+<span class="d">Picked</span> <span class="o">==</span> <span class="o">\A</span> n <span class="o">\in</span> Names : n <span class="o">\in</span> acked <span class="o">~&gt;</span> n <span class="o">\in</span> Effected
+<span class="c">=============================================================================</span></code></pre>
+<ul>
+<li><code>P ~&gt; Q</code> ("leads to"): whenever <code>P</code> holds, <code>Q</code> holds then or later.</li>
+<li>Liveness: it needs the fairness in <code>Spec</code>. Without fairness on <code>Raise</code>, the watermark could stay below <code>n</code> forever and the check fails.</li>
+<li>The <code>====</code> line ends the module.</li>
+</ul>
+<h2 id="the-config">The config</h2>
+<pre><code><span class="k">SPECIFICATION</span> Spec
+<span class="k">CONSTANTS</span>
+    N = 4
+    Producers = {p1, p2}
+<span class="k">INVARIANTS</span> AtMostOnce NoSkip
+<span class="k">PROPERTY</span> Picked
+<span class="k">CHECK_DEADLOCK</span> <span class="k">FALSE</span></code></pre>
+<ul>
+<li>Four names, two producers. <code>p1</code> and <code>p2</code> are model values: opaque, distinct constants.</li>
+<li><code>INVARIANTS</code> are checked in every reachable state, <code>PROPERTY</code> over whole runs.</li>
+<li><code>CHECK_DEADLOCK FALSE</code>: once every name is written and effected, nothing can happen. That is the intended end, not a bug.</li>
+</ul></main></body></html>

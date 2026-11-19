@@ -1,0 +1,482 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>s3log: a command queue and effect log on S3</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #fbfbfa; --panel: #ffffff; --fg: #1d1f23; --muted: #5b616b; --line: #d8dbe0;
+    --soft: #f1f2f4; --hl: #b4530a; --hl-bg: #fff4e5; --focus: #1d4ed8;
+    --acked: #1d4ed8; --ran: #157a3b;
+    --wm: #6d28d9; --last: #0f766e; --band: rgba(15, 118, 110, .10); --list: rgba(109, 40, 217, .16);
+    --on-fill: #ffffff;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #15171a; --panel: #1d2024; --fg: #e7e9ec; --muted: #a2a8b1; --line: #3a3f46;
+      --soft: #24282d; --hl: #f5a524; --hl-bg: #3a2a10; --focus: #8ab4ff;
+      --acked: #7aa7ff; --ran: #5cc98a;
+      --wm: #b79cff; --last: #4fd1c5; --band: rgba(79, 209, 197, .12); --list: rgba(183, 156, 255, .20);
+      --on-fill: #15171a;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg);
+         font: 16px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  main { max-width: 1060px; margin: 0 auto; padding: 24px 20px 64px; }
+  h1 { font-size: 1.6rem; margin: 0 0 4px; }
+  h2 { font-size: 1.25rem; margin: 36px 0 8px; padding-top: 16px; border-top: 1px solid var(--line); }
+  h3 { font-size: 1.02rem; margin: 18px 0 6px; }
+  p { margin: 6px 0 10px; }
+  ul, ol { padding-left: 1.4em; }
+  li { margin: 3px 0; }
+  code, .mono { font-family: var(--mono); font-size: .9em; }
+  .lede { color: var(--muted); margin-top: 0; }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px 16px; }
+  .muted { color: var(--muted); font-weight: 400; }
+
+  /* static diagram */
+  .diagram svg { width: 100%; max-width: 760px; height: auto; display: block; margin: 0 auto; }
+  .diagram text { fill: var(--fg); font: 13px system-ui, sans-serif; }
+  .diagram text.m { font-family: var(--mono); font-size: 12.5px; }
+  .diagram text.s { fill: var(--muted); font-size: 12px; }
+
+  /* navigation */
+  .nav { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin: 12px 0; }
+  button { font: inherit; padding: 6px 14px; border-radius: 6px; border: 1px solid var(--line);
+           background: var(--panel); color: var(--fg); cursor: pointer; }
+  button:hover:not(:disabled) { background: var(--soft); }
+  button:disabled { opacity: .45; cursor: default; }
+  button:focus-visible { outline: 3px solid var(--focus); outline-offset: 2px; }
+  .counter { font-variant-numeric: tabular-nums; color: var(--muted); }
+  .hint { color: var(--muted); font-size: .85rem; margin-left: auto; }
+
+  /* explanation */
+  .explain h3 { margin: 0 0 6px; font-size: 1.1rem; }
+  .explain .clock { color: var(--muted); font-size: .85rem; font-family: var(--mono); }
+  .reqs { margin: 10px 0 0; padding: 8px 10px; background: var(--soft); border-radius: 6px;
+          font-family: var(--mono); font-size: .8rem; line-height: 1.45; list-style: none; }
+  .reqs li { margin: 0; padding-left: 1.4em; text-indent: -1.4em; overflow-wrap: anywhere; }
+  .reqs .who { font-weight: 600; }
+
+  /* name line */
+  .nameline { margin-top: 12px; }
+  .nameline h3 { margin: 0 0 4px; }
+  .nameline svg { width: 100%; height: auto; display: block; }
+  .nameline svg text { fill: var(--fg); font-family: var(--mono); font-size: 12.5px; }
+  .nameline svg text.small { font-size: 12px; fill: var(--muted); }
+  .key { font-size: .85rem; color: var(--muted); margin: 4px 0 0; }
+  .legend { display: flex; flex-wrap: wrap; gap: 6px 16px; font-size: .85rem; margin: 8px 0 0; padding: 0; list-style: none; }
+  .legend li { display: flex; align-items: center; gap: 6px; margin: 0; }
+  .legend svg { width: 22px; height: 22px; flex: none; }
+
+  /* bucket + actors */
+  .grid { display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr); gap: 14px; margin-top: 14px; }
+  @media (max-width: 900px) { .grid { grid-template-columns: minmax(0, 1fr); } }
+  .grid h3 { margin: 0 0 8px; }
+  table { border-collapse: collapse; width: 100%; font-size: .85rem; }
+  th, td { text-align: left; vertical-align: top; padding: 5px 6px; border-bottom: 1px solid var(--line); }
+  th { color: var(--muted); font-weight: 600; }
+  td.k { font-family: var(--mono); white-space: nowrap; }
+  td.v { font-family: var(--mono); overflow-wrap: anywhere; }
+  tr.new td, tr.changed td { background: var(--hl-bg); }
+  .badge { display: inline-block; font: 600 .7rem/1.4 system-ui, sans-serif; text-transform: uppercase; letter-spacing: .03em;
+           border: 1.5px solid var(--hl); color: var(--fg); border-radius: 4px; padding: 0 5px; margin-left: 6px; white-space: nowrap; }
+  .actors { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+  .actor { border: 1px solid var(--line); border-radius: 6px; padding: 7px 9px; font-size: .85rem; }
+  .actor.changed { border: 2px solid var(--hl); background: var(--hl-bg); padding: 6px 8px; }
+  .actor .name { font-weight: 600; }
+  .actor .name .mono { font-weight: 400; color: var(--muted); }
+  .actor .st { display: block; margin-top: 2px; }
+
+  .two { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 20px; }
+  @media (max-width: 800px) { .two { grid-template-columns: minmax(0, 1fr); } }
+  .ref td, .ref th { font-size: .9rem; }
+</style>
+</head>
+<body>
+<main><p style="margin:0 0 12px;font-size:.9rem"><a href="./" style="color:inherit;opacity:.7">← s3log</a></p>
+<h1>s3log</h1>
+<p class="lede">A command queue and effect log kept entirely in one S3 bucket.</p>
+
+<h2 style="border:0;padding-top:0;margin-top:20px">What it's for</h2>
+<p>A database whose only durable state is two logs in an S3 bucket: a command log and an effect log. Clients submit commands (transactions). Commands take effect in one order that everyone agrees on; no command may run twice, and every command a client was told is accepted must run. Clients learn each command's result.</p>
+<p>There is no server to coordinate, and no locks. Any number of writers and producers work at once, and any of them may stop at any time.</p>
+<p><strong>No clock assumptions.</strong> Clocks are not synchronised, and correctness never depends on them. Time only keeps names roughly in order and decides how long a command waits before it is closed. A skewed clock can cost latency or turn more answers into <strong>unknown</strong>; it can never cause a wrong result.</p>
+
+<h2>How it works</h2>
+<ul>
+  <li><strong>Writers</strong> put each command in the bucket as its own object, <code>cmd/&lt;name&gt;</code>. The name is a UUIDv7: it starts with the writer's clock, so names from different writers sort roughly by time. Only one writer's own names are guaranteed to sort in the order it made them.</li>
+  <li><strong>The watermark</strong> is one object holding a name: commands up to it are <em>closed</em>. Producers raise it to <em>now&nbsp;&minus;&nbsp;lag</em> by their own clock, leaving in-flight PUTs time to land; it only ever rises, by compare-and-set. Which value it gets doesn't matter for correctness, only for how many commands are closed before their writer's check. A writer whose name is still above the watermark after its PUT is told <strong>acked</strong>: its command will run.</li>
+  <li><strong>Producers</strong> take the closed commands not yet executed, in name order, execute them, and publish the results as the next effect: <code>fx/a1</code>, <code>fx/a2</code>, &hellip; The PUT is create-only (<code>If-None-Match: *</code>), so the first producer to write effect <em>n</em> wins. There is one history.</li>
+  <li><strong>Replicas</strong> follow the effect log in order and hold the resulting state, to answer queries and hand clients their results. An effect holds its commands' results and the changes they made, so a replica executes nothing. Replicas are ephemeral: any can be dropped and rebuilt from the effect log at any time.</li>
+</ul>
+
+<div class="panel diagram" aria-label="Diagram: writers create cmd objects; producers read closed commands and create numbered effects; replicas read effects">
+<svg viewBox="0 0 760 262" role="img" aria-labelledby="diagtitle">
+  <title id="diagtitle">Writers PUT cmd objects into the bucket. Producers LIST and GET the commands up to the watermark, raise the watermark, and create fx/a1, fx/a2. Replicas GET the effects in order.</title>
+  <defs>
+    <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0L10 5L0 10Z" fill="var(--muted)"/>
+    </marker>
+  </defs>
+  <!-- actors -->
+  <rect x="8" y="40" width="124" height="54" rx="8" fill="var(--soft)" stroke="var(--line)"/>
+  <text x="70" y="63" text-anchor="middle" style="font-weight:600">Writers</text>
+  <text x="70" y="82" text-anchor="middle" class="s">submit commands</text>
+  <rect x="8" y="178" width="124" height="54" rx="8" fill="var(--soft)" stroke="var(--line)"/>
+  <text x="70" y="201" text-anchor="middle" style="font-weight:600">Replicas</text>
+  <text x="70" y="220" text-anchor="middle" class="s">ephemeral</text>
+  <rect x="628" y="40" width="124" height="192" rx="8" fill="var(--soft)" stroke="var(--line)"/>
+  <text x="690" y="128" text-anchor="middle" style="font-weight:600">Producers</text>
+  <text x="690" y="147" text-anchor="middle" class="s">execute, publish</text>
+  <!-- bucket -->
+  <rect x="236" y="8" width="288" height="246" rx="10" fill="none" stroke="var(--fg)" stroke-width="1.5"/>
+  <text x="252" y="29" style="font-weight:600">S3 bucket <tspan class="s">(one prefix)</tspan></text>
+  <rect x="256" y="40" width="248" height="24" rx="4" fill="var(--panel)" stroke="var(--line)"/>
+  <text x="266" y="57" class="m">cmd/0801-A</text>
+  <rect x="256" y="68" width="248" height="24" rx="4" fill="var(--panel)" stroke="var(--line)"/>
+  <text x="266" y="85" class="m">cmd/0801.5-B</text>
+  <text x="502" y="104" text-anchor="end" class="s" style="fill:var(--wm)">closed &#8593;</text>
+  <line x1="248" y1="108" x2="512" y2="108" stroke="var(--wm)" stroke-width="2" stroke-dasharray="6 4"/>
+  <rect x="256" y="114" width="248" height="24" rx="4" fill="var(--panel)" stroke="var(--line)" stroke-dasharray="3 3"/>
+  <text x="266" y="131" class="m">cmd/0803-C</text>
+  <text x="494" y="131" text-anchor="end" class="s">open</text>
+  <rect x="256" y="150" width="248" height="24" rx="4" fill="var(--panel)" stroke="var(--wm)"/>
+  <text x="266" y="167" class="m">watermark = 0802</text>
+  <rect x="256" y="186" width="248" height="24" rx="4" fill="var(--panel)" stroke="var(--last)"/>
+  <text x="266" y="203" class="m">fx/a1  ran A, B</text>
+  <rect x="256" y="214" width="248" height="24" rx="4" fill="var(--panel)" stroke="var(--last)" stroke-dasharray="3 3"/>
+  <text x="266" y="231" class="m">fx/a2  next</text>
+  <!-- arrows -->
+  <line x1="132" y1="67" x2="252" y2="67" stroke="var(--muted)" stroke-width="1.5" marker-end="url(#arr)"/>
+  <text x="192" y="58" text-anchor="middle" class="m">PUT cmd/…</text>
+  <text x="192" y="84" text-anchor="middle" class="s">create-only</text>
+  <line x1="508" y1="66" x2="624" y2="66" stroke="var(--muted)" stroke-width="1.5" marker-end="url(#arr)"/>
+  <text x="566" y="57" text-anchor="middle" class="m">LIST, GET</text>
+  <line x1="624" y1="162" x2="510" y2="162" stroke="var(--muted)" stroke-width="1.5" marker-end="url(#arr)"/>
+  <text x="566" y="153" text-anchor="middle" class="s">raise (CAS)</text>
+  <line x1="624" y1="198" x2="510" y2="198" stroke="var(--muted)" stroke-width="1.5" marker-end="url(#arr)"/>
+  <text x="566" y="189" text-anchor="middle" class="m">PUT fx/…</text>
+  <text x="566" y="215" text-anchor="middle" class="s">create-only</text>
+  <line x1="252" y1="205" x2="136" y2="205" stroke="var(--muted)" stroke-width="1.5" marker-end="url(#arr)"/>
+  <text x="192" y="196" text-anchor="middle" class="m">GET fx/…</text>
+  <text x="192" y="222" text-anchor="middle" class="s">in order</text>
+</svg>
+</div>
+
+<h2>Walkthrough: the happy path</h2>
+<section aria-label="Walkthrough">
+  <div class="nav">
+    <button id="back" type="button" aria-label="Previous step">&larr; Back</button>
+    <button id="next" type="button" aria-label="Next step">Next &rarr;</button>
+    <span class="counter" id="counter" aria-live="polite"></span>
+    <span class="hint">Left / right arrow keys also step.</span>
+  </div>
+
+  <div class="panel explain" id="explain" aria-live="polite"></div>
+
+  <div class="panel nameline">
+    <h3>Name line <span class="muted">(command names in key order = time order)</span></h3>
+    <svg id="line" viewBox="0 0 800 172" role="img" aria-labelledby="linekey"></svg>
+    <p class="key" id="linekey"></p>
+    <ul class="legend" id="legend"></ul>
+  </div>
+
+  <div class="grid">
+    <div class="panel">
+      <h3>Bucket <span class="muted">(in key order)</span></h3>
+      <table>
+        <thead><tr><th scope="col">Key</th><th scope="col">Contents</th></tr></thead>
+        <tbody id="bucket"></tbody>
+      </table>
+    </div>
+    <div class="panel">
+      <h3>Actors</h3>
+      <div class="actors" id="actors"></div>
+    </div>
+  </div>
+</section>
+
+<h2>What if things go wrong?</h2>
+<ul>
+  <li><strong>A slow PUT</strong> lands after the watermark passed its name: the writer is told <strong>unknown</strong>. The effects later say whether it ran.</li>
+  <li><strong>A command that lands behind the latest effect's <code>last</code></strong> is never listed: its outcome is <strong>dead</strong>. Its writer was told unknown, never acked.</li>
+  <li><strong>Two producers race</strong> for <code>fx/&lt;n&gt;</code>: one gets 412, discards its work and applies the winner's effect. Same for the watermark: the CAS loser reads it.</li>
+  <li><strong>A producer crashes</strong>: all state is in the bucket. Any other producer carries on from the effects.</li>
+</ul>
+
+<h2>Reference</h2>
+<table class="ref">
+  <thead><tr><th scope="col">Key</th><th scope="col">Holds</th><th scope="col">Written</th></tr></thead>
+  <tbody>
+    <tr><td class="k">cmd/&lt;name&gt;</td><td>One command. <code>&lt;name&gt;</code>: a UUIDv7.</td><td>Once, by its writer, <code>If-None-Match: *</code>. Never retried.</td></tr>
+    <tr><td class="k">watermark</td><td>A command name; names up to it are closed.</td><td>By producers, <code>If-Match: &lt;etag&gt;</code>, to the UUIDv7 bound for <em>now&nbsp;&minus;&nbsp;lag</em>. Only rises.</td></tr>
+    <tr><td class="k">fx/&lt;n&gt;</td><td>Effect <em>n</em>: <code>last</code> (greatest name it covers) and the commands it ran, in order, with results.</td><td>By producers, <code>If-None-Match: *</code>. First writer wins.</td></tr>
+  </tbody>
+</table>
+<p>Effect keys: <em>n</em> in base62 (<code>0-9A-Za-z</code>) after a letter giving the digit count, so key order is numeric order: <code>a1</code>&hellip;<code>az</code> (1&ndash;61), <code>b10</code> (62), &hellip;</p>
+
+<div class="two">
+  <div>
+    <h3>Writer</h3>
+    <ol>
+      <li>PUT <code>cmd/&lt;new UUIDv7&gt;</code>, <code>If-None-Match: *</code>. Error: <strong>unknown</strong>.</li>
+      <li>GET <code>watermark</code>. Name above it: <strong>acked</strong>. Else <strong>unknown</strong>.</li>
+    </ol>
+    <h3>Replica</h3>
+    <ol>
+      <li>GET <code>fx/&lt;next&gt;</code> until 404; apply each effect's changes and hand out its results.</li>
+      <li>Outcome: <strong>ran</strong> if an effect contains the name; <strong>dead</strong> if an effect's <code>last</code> passed it without it.</li>
+    </ol>
+  </div>
+  <div>
+    <h3>Producer cycle</h3>
+    <ol>
+      <li>Catch up: read <code>fx/&lt;next&gt;</code> until 404.</li>
+      <li>Raise the watermark (CAS); if that fails, GET it.</li>
+      <li>LIST <code>cmd/</code> after the latest <code>last</code>, up to the watermark (and a batch cap).</li>
+      <li>None: wait, repeat. Else GET and execute them in name order.</li>
+      <li>PUT <code>fx/&lt;next&gt;</code>, <code>If-None-Match: *</code>. 412: apply the winner's.</li>
+    </ol>
+  </div>
+</div>
+
+<h3>Guarantees</h3>
+<ul>
+  <li><strong>At most once:</strong> one <code>fx/&lt;n&gt;</code> per <em>n</em>, each covering only names after the previous <code>last</code>.</li>
+  <li><strong>Acked commands are never skipped:</strong> the writer's PUT landed before it saw the watermark below its name. A producer listing past that name read a higher watermark, so later, so its LIST includes the PUT.</li>
+  <li><strong>Acked commands eventually run</strong>, as long as the watermark keeps rising and one producer keeps working.</li>
+</ul>
+
+<h3>S3 assumptions</h3>
+<ul>
+  <li>Conditional PUTs on one key are atomic: one create-only PUT wins; <code>If-Match</code> loses no update.</li>
+  <li>Reads and writes of one key are linearizable (AWS documents read-after-write; linearizability during an in-flight write is assumed).</li>
+  <li>A LIST started after a PUT returned includes it, in key order.</li>
+</ul>
+<p class="muted">Sources: <code>src/s3log/mod.rs</code>; <code>tla/S3Log.tla</code>, annotated in <code>tla/S3Log.md</code>.</p>
+</main>
+
+<script>
+"use strict";
+
+// ---- The scenario --------------------------------------------------------------------------
+// Command names stand in for UUIDv7s: "0801.5-B" = minted at 08:00:01.5 by writer B.
+// They sort by time, like real UUIDv7s.
+const CMDS = {
+  A: { name: "0801-A",   t: 1.0 },
+  B: { name: "0801.5-B", t: 1.5 },
+};
+const WMT = { "0800": 0, "0802": 2 };   // watermark value -> seconds after 08:00:00
+const T_OF = name => name in WMT ? WMT[name] : Object.values(CMDS).find(c => c.name === name).t;
+const STATES = { acked: "acked", ran: "ran" };
+const ACTORS = ["A", "B", "P", "R"];
+const ACTOR_LABEL = { A: "Writer A", B: "Writer B", P: "Producer P", R: "Replica R" };
+
+// Each step patches the previous state; build() turns them into full states.
+// State: clock, wm, etag, fx, cmd (writer -> state), list (range listed this step),
+// act (actor -> status), reqs (requests this step), title, text.
+const PATCHES = [
+  { title: "An empty queue",
+    clock: "08:00:00.5", wm: "0800", etag: "e1", fx: [], cmd: {}, list: null,
+    act: { A: "Idle.", B: "Idle.", P: "Idle. Next effect: fx/a1.", R: "Idle. Next effect: fx/a1." },
+    text: `<p>The bucket holds only <code>watermark</code> = <code>0800</code>: names up to 08:00:00.000 are closed. No commands, no effects.</p>
+           <p>Names below are short stand-ins for UUIDv7s: <code>0801-A</code> means minted at 08:00:01 by writer A.</p>` },
+
+  { title: "A submits a command: acked",
+    clock: "08:00:01.0", cmd: { A: "acked" },
+    act: { A: "Wrote cmd/0801-A. Watermark 0800 < 0801-A. Told: acked." },
+    reqs: [["A", "PUT cmd/0801-A  If-None-Match: *  → 200"], ["A", "GET watermark  → 0800"]],
+    text: `<p>A creates <code>cmd/0801-A</code>, then reads the watermark. <code>0801-A</code> is above <code>0800</code>, so no producer has closed it yet. A is <strong>acked</strong>: its command will run.</p>` },
+
+  { title: "B submits a command: acked",
+    clock: "08:00:01.5", cmd: { B: "acked" },
+    act: { B: "Wrote cmd/0801.5-B. Watermark 0800 < 0801.5-B. Told: acked." },
+    reqs: [["B", "PUT cmd/0801.5-B  If-None-Match: *  → 200"], ["B", "GET watermark  → 0800"]],
+    text: `<p>B does the same. Writers never coordinate: each creates its own object.</p>` },
+
+  { title: "The producer raises the watermark",
+    clock: "08:00:03.0", wm: "0802", etag: "e2",
+    act: { P: "No effects yet (fx/a1: 404). Raised watermark to 0802." },
+    reqs: [["P", "GET fx/a1  → 404"], ["P", "PUT watermark = 0802  If-Match: e1  → 200 (ETag e2)"]],
+    text: `<p>P finds no effects to catch up on. It raises the watermark to now&nbsp;&minus;&nbsp;1&nbsp;s = <code>0802</code> with compare-and-set. A and B are now closed: P may list them.</p>` },
+
+  { title: "The producer lists the closed commands",
+    clock: "08:00:03.1", list: { after: null, upto: "0802" },
+    act: { P: "Listed up to 0802: [0801-A, 0801.5-B]. Fetched both." },
+    reqs: [["P", "LIST cmd/  (from the start, up to 0802)  → [0801-A, 0801.5-B]"],
+           ["P", "GET cmd/0801-A  → 200"], ["P", "GET cmd/0801.5-B  → 200"]],
+    text: `<p>No effect yet, so P lists from the start, stopping at names above <code>0802</code>. It finds A and B, in name order, and fetches them.</p>` },
+
+  { title: "The producer executes them and creates fx/a1",
+    clock: "08:00:03.2", fx: [{ last: "0801.5-B", ran: ["0801-A", "0801.5-B"] }],
+    cmd: { A: "ran", B: "ran" }, list: null,
+    act: { P: "Executed A, then B. Created fx/a1. Next effect: fx/a2." },
+    reqs: [["P", "PUT fx/a1  If-None-Match: *  → 200"]],
+    text: `<p>P executes A then B and creates <code>fx/a1</code>: <code>last</code> = <code>0801.5-B</code>, with both results. The create-only PUT succeeded, so this is <em>the</em> effect 1.</p>
+           <p>The next cycle lists only names after <code>0801.5-B</code>.</p>` },
+
+  { title: "Replicas apply fx/a1; A and B get results",
+    clock: "08:00:03.3",
+    act: { R: "Applied fx/a1 (results of A, B). fx/a2: 404. Next effect: fx/a2.",
+           A: "Told: acked. Result: rA (fx/a1).", B: "Told: acked. Result: rB (fx/a1)." },
+    reqs: [["R", "GET fx/a1  → last = 0801.5-B, ran [0801-A → rA, 0801.5-B → rB]"], ["R", "GET fx/a2  → 404"]],
+    text: `<p>R reads <code>fx/a1</code>: it holds the results of A and B and the changes they made. Anyone reading the effect log in order sees the same state. A and B get their results from it.</p>
+           <p>The cycle repeats: new commands, a higher watermark, <code>fx/a2</code>.</p>` },
+];
+
+function build(patches) {
+  const out = [];
+  let prev = null;
+  for (const p of patches) {
+    const s = prev ? JSON.parse(JSON.stringify(prev)) : {};
+    for (const [k, v] of Object.entries(p)) {
+      if (k === "cmd" || k === "act") s[k] = Object.assign(s[k] || {}, v);
+      else s[k] = v;
+    }
+    if (!("reqs" in p)) s.reqs = [];
+    out.push(s);
+    prev = s;
+  }
+  return out;
+}
+const STEPS = build(PATCHES);
+
+// What a LIST of the prefix would show.
+function bucket(s) {
+  const rows = Object.keys(s.cmd).map(w => ({ key: "cmd/" + CMDS[w].name, val: `command from writer ${w}` }));
+  s.fx.forEach((f, i) => rows.push({
+    key: "fx/a" + (i + 1),
+    val: `last = ${f.last}; ran: ${f.ran.map(n => `${n} → r${n.slice(-1)}`).join(", ")}`,
+  }));
+  rows.push({ key: "watermark", val: `${s.wm}  (ETag ${s.etag})` });
+  return rows.sort((a, b) => a.key < b.key ? -1 : 1);
+}
+const lastOf = s => s.fx.length ? s.fx[s.fx.length - 1].last : null;
+
+// ---- Rendering -------------------------------------------------------------------------------
+// The SVG is as wide as its box (within limits), so its text keeps its size on narrow screens.
+const X0 = 60, TMAX = 3;
+let X1 = 760;
+const xOf = t => X0 + (X1 - X0) * t / TMAX;
+const esc = s => String(s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+
+// State glyphs differ in shape and mark, not only colour.
+function glyph(state, cx, cy) {
+  const r = 9;
+  if (state === "acked") return `<circle cx="${cx}" cy="${cy}" r="${r}" fill="var(--acked)"/>
+    <path d="M${cx} ${cy - 5}v6M${cx} ${cy + 3}v1.5" stroke="var(--on-fill)" stroke-width="2.4" stroke-linecap="round"/>`;
+  return `<rect x="${cx - r}" y="${cy - r}" width="${2 * r}" height="${2 * r}" rx="3" fill="var(--ran)"/>
+    <path d="M${cx - 4.5} ${cy}l3 3.5l6-7" fill="none" stroke="var(--on-fill)" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>`;
+}
+
+function renderLine(s, prev) {
+  const svg = document.getElementById("line");
+  const W = Math.round(Math.min(860, Math.max(560, svg.parentElement.clientWidth - 32)));
+  X1 = W - 45;
+  svg.setAttribute("viewBox", `0 0 ${W} 172`);
+  const last = lastOf(s), Y = 78;
+  let g = "";
+  if (last) g += `<rect x="${X0 - 20}" y="24" width="${xOf(T_OF(last)) - X0 + 20}" height="${Y + 22}" fill="var(--band)"/>`;
+  if (s.list) {
+    const a = s.list.after ? xOf(T_OF(s.list.after)) : X0 - 20;
+    g += `<rect x="${a}" y="${Y - 7}" width="${xOf(T_OF(s.list.upto)) - a}" height="14" rx="3" fill="var(--list)" stroke="var(--wm)" stroke-dasharray="4 3"/>`;
+  }
+  g += `<line x1="${X0 - 20}" y1="${Y}" x2="${X1 + 20}" y2="${Y}" stroke="var(--muted)" stroke-width="1.5"/>`;
+  for (let t = 0; t <= TMAX; t++) {
+    g += `<line x1="${xOf(t)}" y1="${Y - 4}" x2="${xOf(t)}" y2="${Y + 4}" stroke="var(--muted)"/>
+          <text class="small" x="${xOf(t)}" y="${Y + 66}" text-anchor="middle">08:00:0${t}</text>`;
+  }
+  const wx = xOf(T_OF(s.wm)), wmChanged = prev && prev.wm !== s.wm;
+  g += `<line x1="${wx}" y1="22" x2="${wx}" y2="${Y + 14}" stroke="var(--wm)" stroke-width="${wmChanged ? 4 : 2.5}"/>
+        <text x="${Math.max(wx, 70)}" y="15" text-anchor="middle" style="fill:var(--wm);font-weight:${wmChanged ? 700 : 400}">watermark ${s.wm}${wmChanged ? " ▲" : ""}</text>`;
+  if (last) {
+    const lx = xOf(T_OF(last)), lastChanged = !prev || lastOf(prev) !== last;
+    g += `<line x1="${lx}" y1="${Y - 13}" x2="${lx}" y2="${Y + 13}" stroke="var(--last)" stroke-width="${lastChanged ? 3.5 : 2}" stroke-dasharray="5 3"/>
+          <text x="${lx}" y="${Y + 88}" text-anchor="middle" style="fill:var(--last);font-weight:${lastChanged ? 700 : 400}">last ${last}${lastChanged ? " ▲" : ""}</text>`;
+  }
+  // Alternate commands put their labels one row further out, so neighbours don't collide.
+  const order = Object.keys(CMDS).sort((a, b) => CMDS[a].t - CMDS[b].t);
+  for (const [w, st] of Object.entries(s.cmd)) {
+    const cx = xOf(CMDS[w].t), dy = order.indexOf(w) % 2 ? 15 : 0;
+    const changed = prev && prev.cmd[w] !== st;
+    if (changed) g += `<circle cx="${cx}" cy="${Y}" r="15" fill="none" stroke="var(--hl)" stroke-width="2.5"/>`;
+    g += glyph(st, cx, Y);
+    g += `<text x="${cx}" y="${Y - 21 - dy}" text-anchor="middle" style="font-weight:${changed ? 700 : 400}">${CMDS[w].name}</text>
+          <text class="small" x="${cx}" y="${Y + 29 + dy}" text-anchor="middle" style="fill:var(--fg)">${STATES[st]}${changed ? " *" : ""}</text>`;
+  }
+  svg.innerHTML = g;
+
+  const parts = [`Watermark ${s.wm}${wmChanged ? " (raised)" : ""}: names left of it are closed.`];
+  parts.push(last ? `Latest effect's last: ${last}; names at or left of it (shaded) are done.` : "No effects yet.");
+  if (s.list) parts.push(`Dashed bar: range listed this step, ${s.list.after ? "after " + s.list.after : "from the start"} up to ${s.list.upto}.`);
+  const cs = Object.entries(s.cmd).map(([w, st]) => `${CMDS[w].name} ${STATES[st]}`);
+  if (cs.length) parts.push("Commands: " + cs.join(", ") + ".");
+  if (prev && Object.keys(s.cmd).some(w => prev.cmd[w] !== s.cmd[w])) parts.push("Ringed, with *: changed this step.");
+  document.getElementById("linekey").textContent = parts.join(" ");
+}
+
+function renderBucket(s, prev) {
+  const before = prev ? Object.fromEntries(bucket(prev).map(r => [r.key, r.val])) : null;
+  document.getElementById("bucket").innerHTML = bucket(s).map(r => {
+    const mark = !before ? "" : !(r.key in before) ? "new" : before[r.key] !== r.val ? "changed" : "";
+    return `<tr class="${mark}"><td class="k">${esc(r.key)}${mark ? `<span class="badge">${mark}</span>` : ""}</td><td class="v">${esc(r.val)}</td></tr>`;
+  }).join("");
+}
+
+function renderActors(s, prev) {
+  document.getElementById("actors").innerHTML = ACTORS.map(a => {
+    const changed = prev && prev.act[a] !== s.act[a];
+    const name = a in s.cmd ? ` <span class="mono">${CMDS[a].name}</span>` : "";
+    return `<div class="actor${changed ? " changed" : ""}">
+      <span class="name">${ACTOR_LABEL[a]}${name}</span>${changed ? '<span class="badge">updated</span>' : ""}
+      <span class="st">${esc(s.act[a])}</span></div>`;
+  }).join("");
+}
+
+function renderExplain(s, i) {
+  const reqs = s.reqs.length
+    ? `<ul class="reqs" aria-label="Requests this step">${s.reqs.map(([who, r]) => `<li><span class="who">${who}:</span> ${esc(r)}</li>`).join("")}</ul>`
+    : "";
+  document.getElementById("explain").innerHTML =
+    `<div class="clock">Clock ${s.clock} · lag 1 s</div><h3>${i + 1}. ${s.title}</h3>${s.text}${reqs}`;
+}
+
+let cur = 0;
+function render() {
+  const s = STEPS[cur], prev = cur > 0 ? STEPS[cur - 1] : null;
+  renderExplain(s, cur);
+  renderLine(s, prev);
+  renderBucket(s, prev);
+  renderActors(s, prev);
+  document.getElementById("counter").textContent = `Step ${cur + 1} of ${STEPS.length}`;
+  document.getElementById("back").disabled = cur === 0;
+  document.getElementById("next").disabled = cur === STEPS.length - 1;
+}
+function go(d) {
+  const n = Math.min(STEPS.length - 1, Math.max(0, cur + d));
+  if (n !== cur) { cur = n; render(); }
+}
+document.getElementById("back").addEventListener("click", () => go(-1));
+document.getElementById("next").addEventListener("click", () => go(1));
+window.addEventListener("resize", () => renderLine(STEPS[cur], cur > 0 ? STEPS[cur - 1] : null));
+document.addEventListener("keydown", e => {
+  if (e.altKey || e.ctrlKey || e.metaKey) return;
+  if (e.key === "ArrowLeft") { go(-1); e.preventDefault(); }
+  if (e.key === "ArrowRight") { go(1); e.preventDefault(); }
+});
+
+document.getElementById("legend").innerHTML = Object.entries(STATES).map(([k, label]) =>
+  `<li><svg viewBox="0 0 24 24" aria-hidden="true">${glyph(k, 12, 12)}</svg>${label}</li>`).join("") +
+  `<li><svg viewBox="0 0 24 24" aria-hidden="true"><line x1="12" y1="1" x2="12" y2="23" stroke="var(--wm)" stroke-width="2.5"/></svg>watermark</li>
+   <li><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="0" y="0" width="12" height="24" fill="var(--band)"/><line x1="12" y1="1" x2="12" y2="23" stroke="var(--last)" stroke-width="2" stroke-dasharray="4 3"/></svg>latest effect's last; shaded = done</li>
+   <li><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="1" y="7" width="22" height="10" rx="3" fill="var(--list)" stroke="var(--wm)" stroke-dasharray="4 3"/></svg>LIST range</li>`;
+
+render();
+</script>
+</body>
+</html>
