@@ -29,13 +29,9 @@ a.card span{display:block;color:var(--muted);font-size:.92rem;margin-top:2px}
 <a class="card" href="explainer.html"><b>Explainer</b><span>What it's for, the core idea, and a step-by-step happy path.</span></a>
 <a class="card" href="tla.html"><b>TLA+ model, annotated</b><span>The protocol's formal model, explained line by line, with what TLC checked.</span></a>
 
-<h2>Benchmarks</h2>
+<h2>Benchmark</h2>
 <a class="card" href="charts/producers.html"><b>Producers × writers × lag</b><span>The protocol against an in-memory S3 server: 1–5 producers, or every writer producing.</span></a>
-<a class="card" href="charts/writers-produce.html"><b>Writers that produce</b><span>No dedicated producers: writers step in when progress stalls. Fixed and adaptive waits.</span></a>
-<a class="card" href="charts/clients.html"><b>Lean client vs object_store</b><span>What the S3 client's CPU cost does to throughput and latency.</span></a>
-<a class="card" href="charts/engines.html"><b>Where each S3 engine tops out</b><span>Raw operations on RustFS, Versity, SeaweedFS and a MinIO fork: what limits each.</span></a>
-
-<p class="foot">All benchmarks ran on one 2-core VM, the load generator included, with one run per point. Read them for shape, not absolute numbers.</p>
+<p class="foot">The benchmark ran on one 2-core VM, the load generator included, with one run per point. Read it for shape, not absolute numbers.</p>
 </main>
 </body>
 </html>
