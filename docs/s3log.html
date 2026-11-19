@@ -105,18 +105,19 @@
 <h2 style="border:0;padding-top:0;margin-top:20px">What it's for</h2>
 <p>A database whose only durable state is two logs in an S3 bucket: a command log and an effect log. Clients submit commands (transactions). Commands take effect in one order that everyone agrees on; no command may run twice, and every command a client was told is accepted must run. Clients learn each command's result.</p>
 <p>There is no server to coordinate, and no locks. Any number of writers and producers work at once, and any of them may stop at any time.</p>
+<p><strong>No clock assumptions.</strong> Clocks are not synchronised, and correctness never depends on them. Time only keeps names roughly in order and decides how long a command waits before it is closed. A skewed clock can cost latency or turn more answers into <strong>unknown</strong>; it can never cause a wrong result.</p>
 
 <h2>How it works</h2>
 <ul>
-  <li><strong>Writers</strong> put each command in the bucket as its own object, <code>cmd/&lt;name&gt;</code>. The name is a UUIDv7, so names sort by time.</li>
-  <li><strong>The watermark</strong> is one object holding a name: commands up to it are <em>closed</em>. Producers raise it to <em>now&nbsp;&minus;&nbsp;lag</em>, leaving in-flight PUTs time to land. A writer whose name is still above the watermark after its PUT is told <strong>acked</strong>: its command will run.</li>
+  <li><strong>Writers</strong> put each command in the bucket as its own object, <code>cmd/&lt;name&gt;</code>. The name is a UUIDv7: it starts with the writer's clock, so names from different writers sort roughly by time. Only one writer's own names are guaranteed to sort in the order it made them.</li>
+  <li><strong>The watermark</strong> is one object holding a name: commands up to it are <em>closed</em>. Producers raise it to <em>now&nbsp;&minus;&nbsp;lag</em> by their own clock, leaving in-flight PUTs time to land; it only ever rises, by compare-and-set. Which value it gets doesn't matter for correctness, only for how many commands are closed before their writer's check. A writer whose name is still above the watermark after its PUT is told <strong>acked</strong>: its command will run.</li>
   <li><strong>Producers</strong> take the closed commands not yet executed, in name order, execute them, and publish the results as the next effect: <code>fx/a1</code>, <code>fx/a2</code>, &hellip; The PUT is create-only (<code>If-None-Match: *</code>), so the first producer to write effect <em>n</em> wins. There is one history.</li>
-  <li><strong>Readers</strong> read the effect log in order. An effect holds its commands' results and the changes they made, so reading it executes nothing. That is how clients get results.</li>
+  <li><strong>Replicas</strong> follow the effect log in order and hold the resulting state, to answer queries and hand clients their results. An effect holds its commands' results and the changes they made, so a replica executes nothing. Replicas are ephemeral: any can be dropped and rebuilt from the effect log at any time.</li>
 </ul>
 
-<div class="panel diagram" aria-label="Diagram: writers create cmd objects; producers read closed commands and create numbered effects; readers read effects">
+<div class="panel diagram" aria-label="Diagram: writers create cmd objects; producers read closed commands and create numbered effects; replicas read effects">
 <svg viewBox="0 0 760 262" role="img" aria-labelledby="diagtitle">
-  <title id="diagtitle">Writers PUT cmd objects into the bucket. Producers LIST and GET the commands up to the watermark, raise the watermark, and create fx/a1, fx/a2. Readers GET the effects in order.</title>
+  <title id="diagtitle">Writers PUT cmd objects into the bucket. Producers LIST and GET the commands up to the watermark, raise the watermark, and create fx/a1, fx/a2. Replicas GET the effects in order.</title>
   <defs>
     <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
       <path d="M0 0L10 5L0 10Z" fill="var(--muted)"/>
@@ -127,8 +128,8 @@
   <text x="70" y="63" text-anchor="middle" style="font-weight:600">Writers</text>
   <text x="70" y="82" text-anchor="middle" class="s">submit commands</text>
   <rect x="8" y="178" width="124" height="54" rx="8" fill="var(--soft)" stroke="var(--line)"/>
-  <text x="70" y="201" text-anchor="middle" style="font-weight:600">Readers</text>
-  <text x="70" y="220" text-anchor="middle" class="s">read in order</text>
+  <text x="70" y="201" text-anchor="middle" style="font-weight:600">Replicas</text>
+  <text x="70" y="220" text-anchor="middle" class="s">ephemeral</text>
   <rect x="628" y="40" width="124" height="192" rx="8" fill="var(--soft)" stroke="var(--line)"/>
   <text x="690" y="128" text-anchor="middle" style="font-weight:600">Producers</text>
   <text x="690" y="147" text-anchor="middle" class="s">execute, publish</text>
@@ -226,7 +227,7 @@
       <li>PUT <code>cmd/&lt;new UUIDv7&gt;</code>, <code>If-None-Match: *</code>. Error: <strong>unknown</strong>.</li>
       <li>GET <code>watermark</code>. Name above it: <strong>acked</strong>. Else <strong>unknown</strong>.</li>
     </ol>
-    <h3>Reader</h3>
+    <h3>Replica</h3>
     <ol>
       <li>GET <code>fx/&lt;next&gt;</code> until 404; apply each effect's changes and hand out its results.</li>
       <li>Outcome: <strong>ran</strong> if an effect contains the name; <strong>dead</strong> if an effect's <code>last</code> passed it without it.</li>
@@ -274,7 +275,7 @@ const WMT = { "0800": 0, "0802": 2 };   // watermark value -> seconds after 08:0
 const T_OF = name => name in WMT ? WMT[name] : Object.values(CMDS).find(c => c.name === name).t;
 const STATES = { acked: "acked", ran: "ran" };
 const ACTORS = ["A", "B", "P", "R"];
-const ACTOR_LABEL = { A: "Writer A", B: "Writer B", P: "Producer P", R: "Reader R" };
+const ACTOR_LABEL = { A: "Writer A", B: "Writer B", P: "Producer P", R: "Replica R" };
 
 // Each step patches the previous state; build() turns them into full states.
 // State: clock, wm, etag, fx, cmd (writer -> state), list (range listed this step),
@@ -319,7 +320,7 @@ const PATCHES = [
     text: `<p>P executes A then B and creates <code>fx/a1</code>: <code>last</code> = <code>0801.5-B</code>, with both results. The create-only PUT succeeded, so this is <em>the</em> effect 1.</p>
            <p>The next cycle lists only names after <code>0801.5-B</code>.</p>` },
 
-  { title: "Readers apply fx/a1; A and B get results",
+  { title: "Replicas apply fx/a1; A and B get results",
     clock: "08:00:03.3",
     act: { R: "Applied fx/a1 (results of A, B). fx/a2: 404. Next effect: fx/a2.",
            A: "Told: acked. Result: rA (fx/a1).", B: "Told: acked. Result: rB (fx/a1)." },
