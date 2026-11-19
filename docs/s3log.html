@@ -1,0 +1,512 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>s3log: a command queue and effect log on S3</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #fbfbfa; --panel: #ffffff; --fg: #1d1f23; --muted: #5b616b; --line: #d8dbe0;
+    --soft: #f1f2f4; --hl: #b4530a; --hl-bg: #fff4e5; --focus: #1d4ed8;
+    --acked: #1d4ed8; --unknown: #a15c00; --ran: #157a3b; --dead: #b42318;
+    --wm: #6d28d9; --last: #0f766e; --band: rgba(15, 118, 110, .10); --list: rgba(109, 40, 217, .16);
+    --on-fill: #ffffff;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #15171a; --panel: #1d2024; --fg: #e7e9ec; --muted: #a2a8b1; --line: #343940;
+      --soft: #24282d; --hl: #f5a524; --hl-bg: #3a2a10; --focus: #8ab4ff;
+      --acked: #7aa7ff; --unknown: #f0b44c; --ran: #5cc98a; --dead: #ff8a80;
+      --wm: #b79cff; --last: #4fd1c5; --band: rgba(79, 209, 197, .12); --list: rgba(183, 156, 255, .20);
+      --on-fill: #15171a;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg);
+         font: 16px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  main { max-width: 1100px; margin: 0 auto; padding: 24px 20px 64px; }
+  h1 { font-size: 1.6rem; margin: 0 0 4px; }
+  h2 { font-size: 1.25rem; margin: 40px 0 8px; padding-top: 16px; border-top: 1px solid var(--line); }
+  h3 { font-size: 1.02rem; margin: 20px 0 6px; }
+  p { margin: 6px 0 10px; }
+  code, .mono { font-family: var(--mono); font-size: .9em; }
+  .lede { color: var(--muted); margin-top: 0; }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px 16px; }
+
+  /* navigation */
+  .nav { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin: 16px 0 12px; }
+  button { font: inherit; padding: 6px 14px; border-radius: 6px; border: 1px solid var(--line);
+           background: var(--panel); color: var(--fg); cursor: pointer; }
+  button:hover:not(:disabled) { background: var(--soft); }
+  button:disabled { opacity: .45; cursor: default; }
+  button:focus-visible { outline: 3px solid var(--focus); outline-offset: 2px; }
+  .counter { font-variant-numeric: tabular-nums; color: var(--muted); }
+  .hint { color: var(--muted); font-size: .85rem; margin-left: auto; }
+
+  /* explanation */
+  .explain h2 { border: 0; margin: 0 0 6px; padding: 0; font-size: 1.15rem; }
+  .explain .clock { color: var(--muted); font-size: .85rem; font-family: var(--mono); }
+  .reqs { margin: 10px 0 0; padding: 8px 10px; background: var(--soft); border-radius: 6px;
+          font-family: var(--mono); font-size: .8rem; line-height: 1.45; list-style: none; }
+  .reqs li { padding-left: 1.4em; text-indent: -1.4em; overflow-wrap: anywhere; }
+  .reqs .who { font-weight: 600; }
+
+  /* name line */
+  .nameline { margin-top: 12px; }
+  .nameline svg { width: 100%; height: auto; display: block; }
+  .nameline svg text { fill: var(--fg); font-family: var(--mono); font-size: 12.5px; }
+  .nameline svg text.small { font-size: 12px; fill: var(--muted); }
+  .key { font-size: .85rem; color: var(--muted); margin: 4px 0 0; }
+  .legend { display: flex; flex-wrap: wrap; gap: 6px 16px; font-size: .85rem; margin: 8px 0 0; padding: 0; list-style: none; }
+  .legend li { display: flex; align-items: center; gap: 6px; }
+  .legend svg { width: 22px; height: 22px; flex: none; }
+
+  /* bucket + actors */
+  .grid { display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr); gap: 14px; margin-top: 14px; }
+  @media (max-width: 900px) { .grid { grid-template-columns: minmax(0, 1fr); } }
+  .grid h3 { margin: 0 0 8px; }
+  table { border-collapse: collapse; width: 100%; font-size: .85rem; }
+  th, td { text-align: left; vertical-align: top; padding: 5px 6px; border-bottom: 1px solid var(--line); }
+  th { color: var(--muted); font-weight: 600; }
+  td.k { font-family: var(--mono); white-space: nowrap; }
+  td.v { font-family: var(--mono); overflow-wrap: anywhere; }
+  tr.new td, tr.changed td { background: var(--hl-bg); }
+  .badge { display: inline-block; font: 600 .7rem/1.4 system-ui, sans-serif; text-transform: uppercase; letter-spacing: .03em;
+           border: 1.5px solid var(--hl); color: var(--fg); border-radius: 4px; padding: 0 5px; margin-left: 6px; white-space: nowrap; }
+  .empty { color: var(--muted); font-style: italic; }
+  .actors { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+  .actor { border: 1px solid var(--line); border-radius: 6px; padding: 7px 9px; font-size: .85rem; }
+  .actor.changed { border: 2px solid var(--hl); background: var(--hl-bg); padding: 6px 8px; }
+  .actor .name { font-weight: 600; }
+  .actor .name .mono { font-weight: 400; color: var(--muted); }
+  .actor .st { display: block; margin-top: 2px; }
+  .actor.crashed { opacity: .75; border-style: dashed; }
+
+  /* static section */
+  ol, ul { padding-left: 1.4em; }
+  li { margin: 3px 0; }
+  .two { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 20px; }
+  @media (max-width: 800px) { .two { grid-template-columns: minmax(0, 1fr); } }
+  .summary-table td, .summary-table th { font-size: .9rem; }
+  .outcomes { margin-top: 10px; }
+</style>
+</head>
+<body>
+<main>
+<h1>s3log</h1>
+<p class="lede">A command queue and an effect log for one database, stored as objects in one S3 bucket. No server, no locks, no retries: just conditional PUTs, GETs and LISTs.</p>
+
+<section aria-label="Walkthrough">
+  <div class="nav">
+    <button id="back" type="button" aria-label="Previous step">&larr; Back</button>
+    <button id="next" type="button" aria-label="Next step">Next &rarr;</button>
+    <span class="counter" id="counter" aria-live="polite"></span>
+    <span class="hint">Left / right arrow keys also step.</span>
+  </div>
+
+  <div class="panel explain" id="explain" aria-live="polite"></div>
+
+  <div class="panel nameline">
+    <h3 style="margin:0 0 4px">Name line <span class="small" style="font-weight:400;color:var(--muted)">(command names in key order = time order)</span></h3>
+    <svg id="line" viewBox="0 0 800 172" role="img" aria-labelledby="linekey"></svg>
+    <p class="key" id="linekey"></p>
+    <ul class="legend" id="legend"></ul>
+  </div>
+
+  <div class="grid">
+    <div class="panel">
+      <h3>Bucket <span style="font-weight:400;color:var(--muted)">(keys under the database's prefix, in key order)</span></h3>
+      <table>
+        <thead><tr><th scope="col">Key</th><th scope="col">Contents</th></tr></thead>
+        <tbody id="bucket"></tbody>
+      </table>
+    </div>
+    <div class="panel">
+      <h3>Actors</h3>
+      <div class="actors" id="actors"></div>
+    </div>
+  </div>
+</section>
+
+<h2>Reference</h2>
+
+<h3>Objects</h3>
+<table class="summary-table">
+  <thead><tr><th scope="col">Key</th><th scope="col">Holds</th><th scope="col">Written</th></tr></thead>
+  <tbody>
+    <tr><td class="k">cmd/&lt;name&gt;</td><td>One command. <code>&lt;name&gt;</code> is a UUIDv7: unique, and its text order is time order.</td><td>Once, by its writer, with <code>If-None-Match: *</code>. Never retried.</td></tr>
+    <tr><td class="k">watermark</td><td>A command name. Producers list commands only up to it.</td><td>By producers, with compare-and-set (<code>If-Match: &lt;etag&gt;</code>), to the UUIDv7 bound for <em>now&nbsp;&minus;&nbsp;lag</em>. Never goes down.</td></tr>
+    <tr><td class="k">fx/&lt;n&gt;</td><td>Effect <em>n</em> = 1, 2, 3, &hellip;: <code>last</code> (the greatest command name it covers) and the commands it ran, in name order, with their results.</td><td>By producers, with <code>If-None-Match: *</code>. The first PUT of <code>fx/&lt;n&gt;</code> wins; the others get 412.</td></tr>
+  </tbody>
+</table>
+<p><strong>Effect keys.</strong> <em>n</em> in base62 (<code>0-9A-Za-z</code>), prefixed by a letter for the digit count (<code>a</code> = 1 digit). So 1&nbsp;&rarr;&nbsp;<code>a1</code>, 10&nbsp;&rarr;&nbsp;<code>aA</code>, 61&nbsp;&rarr;&nbsp;<code>az</code>, 62&nbsp;&rarr;&nbsp;<code>b10</code>, 3843&nbsp;&rarr;&nbsp;<code>bzz</code>, 3844&nbsp;&rarr;&nbsp;<code>c100</code>. Key order is numeric order.</p>
+<p><strong>The watermark bound.</strong> The UUID with timestamp <em>t</em> ms and all other bits zero. It sorts above every UUIDv7 from before <em>t</em> and below every one from <em>t</em> on.</p>
+
+<div class="two">
+  <div>
+    <h3>Writer: submit a command</h3>
+    <ol>
+      <li>Pick a fresh UUIDv7 <code>name</code>. PUT <code>cmd/&lt;name&gt;</code> with <code>If-None-Match: *</code>. Any error: <strong>unknown</strong>. No retry.</li>
+      <li>GET <code>watermark</code>. If <code>name &gt; watermark</code>: <strong>acked</strong>, it will run. Otherwise <strong>unknown</strong>: it may or may not run; its outcome will say.</li>
+    </ol>
+    <h3>Reader</h3>
+    <ol>
+      <li>GET <code>fx/&lt;next&gt;</code> until 404. Apply each effect: re-execute its commands in order; the results must match.</li>
+      <li>A command's outcome: <strong>ran</strong>, with its result, if an effect contains it. <strong>dead</strong> if an effect's <code>last</code> passed its name without it. Every name &le; the latest <code>last</code> is decided.</li>
+    </ol>
+  </div>
+  <div>
+    <h3>Producer cycle (any number run it at once)</h3>
+    <ol>
+      <li>Catch up: GET <code>fx/&lt;next&gt;</code> until 404, applying each effect.</li>
+      <li>Raise the watermark to <em>now&nbsp;&minus;&nbsp;lag</em> by compare-and-set, and use the value written. If the raise fails or isn't needed, GET it.</li>
+      <li>LIST <code>cmd/</code> starting after the latest effect's <code>last</code>, in key order. Stop at names above the watermark just read, or at the batch cap.</li>
+      <li>Nothing listed: wait, repeat. Else GET each command and execute them in name order.</li>
+      <li>PUT <code>fx/&lt;next&gt;</code> with <code>If-None-Match: *</code>, <code>last</code> = the last name listed. Success: it is canonical. 412: another producer won; discard own work, GET and apply theirs. (On any other error, GET it: the object, if present, decides; if absent, PUT again.)</li>
+    </ol>
+  </div>
+</div>
+
+<h3>Guarantees, and why</h3>
+<ul>
+  <li><strong>At most once.</strong> An effect is created only if absent, so there is one <code>fx/&lt;n&gt;</code> per <em>n</em>. Each lists only names strictly after the previous <code>last</code>, so no two effects share a command.</li>
+  <li><strong>An acked command is never skipped.</strong> Its PUT landed before its writer read a watermark below its name. A producer that lists past that name read a watermark &ge; the name, so it read after the writer did, so its LIST started after the PUT landed and includes it. <code>last</code> only moves over names a LIST returned.</li>
+  <li><strong>Late PUTs are harmless.</strong> A command that lands at or below an effect's <code>last</code> is never listed again: it is dead. Its writer cannot have been acked: the watermark it reads is &ge; that <code>last</code>.</li>
+  <li><strong>Every acked command eventually runs</strong>, as long as the watermark keeps rising and one producer keeps working.</li>
+  <li><strong>Producers may crash anywhere.</strong> State lives only in the bucket. Racing producers waste work; the conditional effect PUT keeps one result.</li>
+</ul>
+<p><strong>Unknown means unknown.</strong> A writer that sees <code>name &le; watermark</code> may still run, if its PUT landed before a LIST passed its name. Wait for the outcome; make the command idempotent if retrying matters.</p>
+
+<h3>What it assumes about S3</h3>
+<ul>
+  <li>Conditional PUTs on one key are atomic: of racing <code>If-None-Match: *</code> PUTs one wins; <code>If-Match</code> loses no update.</li>
+  <li>Reads and writes of one key are linearizable: once any client has read a value, no later read returns an older one. AWS documents read-after-write consistency; linearizability while a write is in flight is assumed.</li>
+  <li>A LIST started after a PUT returned includes that key. LIST returns keys in byte order.</li>
+</ul>
+<p>Sources: <code>src/s3log/mod.rs</code>; the TLA+ model <code>tla/S3Log.tla</code>, annotated in <code>tla/S3Log.md</code>.</p>
+</main>
+
+<script>
+"use strict";
+
+// ---- Fixed facts of the scenario -------------------------------------------------------------
+// Command names: stand-ins for UUIDv7s. "0801.5-B" = minted at 08:00:01.5 by writer B.
+// String order of these stand-ins equals time order, as with real UUIDv7s.
+const CMDS = {
+  D: { name: "0800.5-D", t: 0.5 },
+  A: { name: "0801-A",   t: 1.0 },
+  B: { name: "0801.5-B", t: 1.5 },
+  C: { name: "0803.5-C", t: 3.5 },
+};
+const WMT = { "0800": 0, "0802": 2, "0804": 4 };   // watermark value -> seconds after 08:00:00
+const T_OF = name => name in WMT ? WMT[name] : Object.values(CMDS).find(c => c.name === name).t;
+const STATES = {
+  inflight: "in flight", landed: "landed", acked: "acked", unknown: "unknown", ran: "ran", dead: "dead",
+};
+const ACTORS = ["A", "B", "C", "D", "P1", "P2"];
+
+// ---- Steps ---------------------------------------------------------------------------------
+// Each step is a patch on the previous state; build() turns them into full states.
+// State: clock, wm, etag, fx (effects), cmd (writer -> dot state), list (range listed this step),
+// act (actor -> status text), reqs (requests this step), title, text.
+const PATCHES = [
+  { title: "The bucket at rest",
+    clock: "08:00:00.0", wm: "0800", etag: "e1", fx: [], cmd: {}, list: null,
+    act: { A: "Idle.", B: "Idle.", C: "Idle.", D: "Idle.",
+           P1: "Idle. Applied: none. Next: fx/a1.", P2: "Idle. Applied: none. Next: fx/a1." },
+    text: `<p>One database's prefix holds only <code>watermark</code>, at <code>0800</code>: the UUIDv7 bound for 08:00:00.000. No commands, no effects.</p>
+           <p>Names here are short stand-ins for UUIDv7s: <code>0801.5-B</code> means minted at 08:00:01.5 by writer B. Like real UUIDv7s, they sort by time. Producers raise the watermark to <em>now&nbsp;&minus;&nbsp;1&nbsp;s</em>.</p>` },
+
+  { title: "D starts a write; the PUT stalls",
+    clock: "08:00:00.5", cmd: { D: "inflight" },
+    act: { D: "Sent PUT cmd/0800.5-D. No response yet." },
+    reqs: [["D", "PUT cmd/0800.5-D  If-None-Match: *  … (stalled)"]],
+    text: `<p>Writer D picks the name <code>0800.5-D</code> and sends its PUT. The request stalls in the network. D never retries, so this one PUT decides everything for D.</p>` },
+
+  { title: "A's PUT lands",
+    clock: "08:00:01.0", cmd: { A: "landed" },
+    act: { A: "PUT cmd/0801-A → 200. Next: read the watermark." },
+    reqs: [["A", "PUT cmd/0801-A  If-None-Match: *  → 200"]],
+    text: `<p>Writer A creates <code>cmd/0801-A</code>. The object exists, but A does not yet know whether it will run.</p>` },
+
+  { title: "A reads the watermark: acked",
+    clock: "08:00:01.0", cmd: { A: "acked" },
+    act: { A: "Watermark 0800 < 0801-A. Told: acked." },
+    reqs: [["A", "GET watermark  → 0800"]],
+    text: `<p><code>0801-A</code> &gt; <code>0800</code>, so A is <strong>acked</strong>: it will run.</p>
+           <p>Why: any producer that lists past <code>0801-A</code> must first read a watermark &ge; <code>0801-A</code>. That read comes after A's read, so after A's PUT landed, so its LIST includes A.</p>` },
+
+  { title: "B starts a write; the PUT is slow",
+    clock: "08:00:01.5", cmd: { B: "inflight" },
+    act: { B: "Sent PUT cmd/0801.5-B. No response yet." },
+    reqs: [["B", "PUT cmd/0801.5-B  If-None-Match: *  … (in flight)"]],
+    text: `<p>Writer B picks <code>0801.5-B</code> and sends its PUT. It is slow. Now two PUTs are in flight: B's and D's.</p>` },
+
+  { title: "Producers catch up and raise the watermark",
+    clock: "08:00:03.0", wm: "0802", etag: "e2",
+    act: { P1: "No effects yet (fx/a1: 404). Raised watermark to 0802. Holds 0802.",
+           P2: "No effects yet (fx/a1: 404). Raise lost (412); read 0802. Holds 0802." },
+    reqs: [["P1", "GET fx/a1  → 404"], ["P2", "GET fx/a1  → 404"],
+           ["P1", "PUT watermark = 0802  If-Match: e1  → 200 (ETag e2)"],
+           ["P2", "PUT watermark = 0802  If-Match: e1  → 412"],
+           ["P2", "GET watermark  → 0802 (ETag e2)"]],
+    text: `<p>Both producers find no effects. Now is 08:00:03.0, so both try to raise the watermark to <code>0802</code> with compare-and-set. P1 wins; P2 gets 412 and reads it. The watermark never goes down.</p>
+           <p>(Real producers raise it every cycle. This run shows two raises only; the outcomes below do not depend on that.)</p>` },
+
+  { title: "Both producers LIST up to 0802",
+    clock: "08:00:03.1", list: { after: null, upto: "0802" },
+    act: { P1: "Listed up to 0802: [0801-A].", P2: "Listed up to 0802: [0801-A]." },
+    reqs: [["P1", "LIST cmd/  (from the start, up to 0802)  → [0801-A]"],
+           ["P2", "LIST cmd/  (from the start, up to 0802)  → [0801-A]"]],
+    text: `<p>No effect yet, so they list from the start, stopping above <code>0802</code>. Both see only <code>0801-A</code>. B and D are in range but still in flight, so not listed.</p>
+           <p>That is safe: B and D can no longer be acked. Each will read a watermark &ge; <code>0802</code>, which is above its name.</p>` },
+
+  { title: "Race for fx/a1: P1 wins",
+    clock: "08:00:03.2", fx: [{ last: "0801-A", ran: ["0801-A"] }], cmd: { A: "ran" }, list: null,
+    act: { A: "Told: acked. Outcome: ran (fx/a1).",
+           P1: "Executed 0801-A; created fx/a1. Applied: a1. Next: fx/a2.",
+           P2: "Executed 0801-A; fx/a1 → 412. Applied P1's fx/a1. Next: fx/a2." },
+    reqs: [["P1", "GET cmd/0801-A  → 200"], ["P2", "GET cmd/0801-A  → 200"],
+           ["P1", "PUT fx/a1  If-None-Match: *  → 200"],
+           ["P2", "PUT fx/a1  If-None-Match: *  → 412"],
+           ["P2", "GET fx/a1  → last = 0801-A, ran [0801-A]"]],
+    text: `<p>Both execute A and PUT <code>fx/a1</code>. P1's lands first and is canonical; P2 gets 412, discards its own work and applies P1's effect. (Here they are identical. With different listings they would differ, and only P1's would count.)</p>
+           <p>Every name &le; <code>last</code> = <code>0801-A</code> is now decided. D's name is below it and not in fx/a1: D is <strong>dead</strong>, though its PUT has not even landed.</p>` },
+
+  { title: "B's PUT lands late: unknown",
+    clock: "08:00:03.3", cmd: { B: "unknown" },
+    act: { B: "PUT → 200. Watermark 0802 ≥ 0801.5-B. Told: unknown." },
+    reqs: [["B", "PUT cmd/0801.5-B  → 200 (finally)"], ["B", "GET watermark  → 0802"]],
+    text: `<p>B's PUT lands. B reads <code>0802</code> &ge; <code>0801.5-B</code>: <strong>unknown</strong>. B cannot tell whether a LIST already passed its name.</p>
+           <p>None has: B is above <code>last</code> = <code>0801-A</code>, so the next LIST, which starts after <code>0801-A</code>, will include it.</p>` },
+
+  { title: "D's PUT lands even later: dead",
+    clock: "08:00:03.4", cmd: { D: "dead" },
+    act: { D: "PUT → 200. Watermark 0802 ≥ 0800.5-D. Told: unknown. Outcome: dead (fx/a1's last passed it)." },
+    reqs: [["D", "PUT cmd/0800.5-D  → 200 (finally)"], ["D", "GET watermark  → 0802"]],
+    text: `<p>D's PUT lands; D reads <code>0802</code>: unknown. Its outcome is <strong>dead</strong>: <code>0800.5-D</code> &le; fx/a1's <code>last</code> and fx/a1 doesn't contain it.</p>
+           <p>Every LIST from now on starts after <code>0801-A</code>, so <code>cmd/0800.5-D</code> is never read. A late PUT is harmless.</p>` },
+
+  { title: "C writes: acked",
+    clock: "08:00:03.5", cmd: { C: "acked" },
+    act: { C: "PUT cmd/0803.5-C → 200. Watermark 0802 < 0803.5-C. Told: acked." },
+    reqs: [["C", "PUT cmd/0803.5-C  If-None-Match: *  → 200"], ["C", "GET watermark  → 0802"]],
+    text: `<p>Writer C creates <code>cmd/0803.5-C</code> and reads <code>0802</code>. Its name is above: <strong>acked</strong>.</p>` },
+
+  { title: "Next cycle: raise to 0804, LIST after 0801-A",
+    clock: "08:00:05.0", wm: "0804", etag: "e3", list: { after: "0801-A", upto: "0804" },
+    act: { P1: "fx/a2: 404. Raise lost (412); read 0804. Listed after 0801-A up to 0804: [0801.5-B, 0803.5-C].",
+           P2: "fx/a2: 404. Raised watermark to 0804. Listed after 0801-A up to 0804: [0801.5-B, 0803.5-C]." },
+    reqs: [["P1", "GET fx/a2  → 404"], ["P2", "GET fx/a2  → 404"],
+           ["P2", "PUT watermark = 0804  If-Match: e2  → 200 (ETag e3)"],
+           ["P1", "PUT watermark = 0804  If-Match: e2  → 412"],
+           ["P1", "GET watermark  → 0804 (ETag e3)"],
+           ["P1", "LIST cmd/  start-after 0801-A, up to 0804  → [0801.5-B, 0803.5-C]"],
+           ["P2", "LIST cmd/  start-after 0801-A, up to 0804  → [0801.5-B, 0803.5-C]"]],
+    text: `<p>This time P2 wins the raise. Both list after fx/a1's <code>last</code>, up to <code>0804</code>, and get B and C. D is in the bucket but below the start: not listed.</p>
+           <p>B's writer was told unknown, yet B is listed: it is present and above <code>last</code>.</p>` },
+
+  { title: "P1 crashes; P2 writes fx/a2",
+    clock: "08:00:05.1", fx: [{ last: "0801-A", ran: ["0801-A"] }, { last: "0803.5-C", ran: ["0801.5-B", "0803.5-C"] }],
+    cmd: { B: "ran", C: "ran" }, list: null,
+    act: { P1: "Crashed. On restart it reads fx/a1, fx/a2 and carries on.",
+           P2: "Executed 0801.5-B, 0803.5-C; created fx/a2. Applied: a1, a2. Next: fx/a3.",
+           B: "Told: unknown. Outcome: ran (fx/a2).",
+           C: "Told: acked. Outcome: ran (fx/a2)." },
+    reqs: [["P1", "(crashed)"], ["P2", "GET cmd/0801.5-B  → 200"], ["P2", "GET cmd/0803.5-C  → 200"],
+           ["P2", "PUT fx/a2  If-None-Match: *  → 200"]],
+    text: `<p>P1 crashes. Nothing is lost: P2 executes B then C, in name order, and creates <code>fx/a2</code> with <code>last</code> = <code>0803.5-C</code>.</p>
+           <p>B was <strong>unknown</strong> and <strong>ran</strong>; D was unknown and is dead. Unknown means unknown: the effects decide.</p>` },
+
+  { title: "Summary",
+    clock: "08:00:05.1", reqs: [],
+    text: `<ul>
+             <li><strong>At most once:</strong> one <code>fx/&lt;n&gt;</code> per <em>n</em>, each after the previous <code>last</code>.</li>
+             <li><strong>Acked never skipped:</strong> A and C ran. Listing past a name needs a watermark read after its writer's.</li>
+             <li><strong>Late PUTs harmless:</strong> D landed below <code>last</code> and is dead.</li>
+             <li><strong>Unknown is decided later:</strong> B ran, D didn't.</li>
+             <li><strong>Crashes and races</strong> waste work, never break it.</li>
+           </ul>
+           <table class="outcomes"><thead><tr><th>Command</th><th>Writer told</th><th>Outcome</th></tr></thead><tbody>
+             <tr><td class="k">0800.5-D</td><td>unknown</td><td>dead</td></tr>
+             <tr><td class="k">0801-A</td><td>acked</td><td>ran (fx/a1)</td></tr>
+             <tr><td class="k">0801.5-B</td><td>unknown</td><td>ran (fx/a2)</td></tr>
+             <tr><td class="k">0803.5-C</td><td>acked</td><td>ran (fx/a2)</td></tr>
+           </tbody></table>` },
+];
+
+function build(patches) {
+  const out = [];
+  let prev = null;
+  for (const p of patches) {
+    const s = prev ? JSON.parse(JSON.stringify(prev)) : {};
+    for (const [k, v] of Object.entries(p)) {
+      if (k === "cmd" || k === "act") s[k] = Object.assign(s[k] || {}, v);
+      else s[k] = v;
+    }
+    if (!("reqs" in p)) s.reqs = [];
+    out.push(s);
+    prev = s;
+  }
+  return out;
+}
+const STEPS = build(PATCHES);
+
+// The bucket an S3 LIST of the prefix would show.
+function bucket(s) {
+  const rows = [];
+  for (const [w, st] of Object.entries(s.cmd)) {
+    if (st !== "inflight") rows.push({ key: "cmd/" + CMDS[w].name, val: `command from writer ${w}` });
+  }
+  s.fx.forEach((f, i) => rows.push({
+    key: "fx/a" + (i + 1),
+    val: `last = ${f.last}; ran: ${f.ran.map(n => `${n} → r${n.slice(-1)}`).join(", ")}`,
+  }));
+  rows.push({ key: "watermark", val: `${s.wm}  (ETag ${s.etag})` });
+  return rows.sort((a, b) => a.key < b.key ? -1 : 1);
+}
+const lastOf = s => s.fx.length ? s.fx[s.fx.length - 1].last : null;
+
+// ---- Rendering -------------------------------------------------------------------------------
+// The SVG is as wide as its box (within limits), so text keeps its size on narrow screens.
+const X0 = 60, TMAX = 4.5;
+let X1 = 760;
+const xOf = t => X0 + (X1 - X0) * t / TMAX;
+const esc = s => String(s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+
+// The glyph for a state: shape, fill and inner mark differ, not only colour.
+function glyph(state, cx, cy) {
+  const r = 9;
+  switch (state) {
+    case "inflight": return `<circle cx="${cx}" cy="${cy}" r="${r}" fill="var(--panel)" stroke="var(--fg)" stroke-width="2" stroke-dasharray="3 3"/>`;
+    case "landed":   return `<circle cx="${cx}" cy="${cy}" r="${r}" fill="var(--panel)" stroke="var(--fg)" stroke-width="2"/>
+                             <circle cx="${cx}" cy="${cy}" r="3" fill="var(--fg)"/>`;
+    case "acked":    return `<circle cx="${cx}" cy="${cy}" r="${r}" fill="var(--acked)"/>
+                             <path d="M${cx} ${cy - 5}v6M${cx} ${cy + 3}v1.5" stroke="var(--on-fill)" stroke-width="2.4" stroke-linecap="round"/>`;
+    case "unknown":  return `<path d="M${cx} ${cy - 11}L${cx + 11} ${cy}L${cx} ${cy + 11}L${cx - 11} ${cy}Z" fill="var(--unknown)"/>
+                             <text x="${cx}" y="${cy + 4.5}" text-anchor="middle" style="fill:var(--on-fill);font:700 12px system-ui,sans-serif">?</text>`;
+    case "ran":      return `<rect x="${cx - r}" y="${cy - r}" width="${2 * r}" height="${2 * r}" rx="3" fill="var(--ran)"/>
+                             <path d="M${cx - 4.5} ${cy}l3 3.5l6-7" fill="none" stroke="var(--on-fill)" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>`;
+    case "dead":     return `<circle cx="${cx}" cy="${cy}" r="${r}" fill="var(--dead)"/>
+                             <path d="M${cx - 4} ${cy - 4}l8 8M${cx + 4} ${cy - 4}l-8 8" stroke="var(--on-fill)" stroke-width="2.4" stroke-linecap="round"/>`;
+  }
+}
+
+function renderLine(s, prev) {
+  const last = lastOf(s);
+  const Y = 78;
+  const svg = document.getElementById("line");
+  const W = Math.round(Math.min(860, Math.max(560, svg.parentElement.clientWidth - 32)));
+  X1 = W - 45;
+  svg.setAttribute("viewBox", `0 0 ${W} 172`);
+  let g = "";
+  // Decided band: names <= last.
+  if (last) g += `<rect x="${X0 - 20}" y="24" width="${xOf(T_OF(last)) - X0 + 20}" height="${Y + 22}" fill="var(--band)"/>`;
+  // LIST range of this step.
+  if (s.list) {
+    const a = s.list.after ? xOf(T_OF(s.list.after)) : X0 - 20;
+    g += `<rect x="${a}" y="${Y - 7}" width="${xOf(T_OF(s.list.upto)) - a}" height="14" rx="3" fill="var(--list)" stroke="var(--wm)" stroke-dasharray="4 3"/>`;
+  }
+  // Axis and ticks.
+  g += `<line x1="${X0 - 20}" y1="${Y}" x2="${X1 + 20}" y2="${Y}" stroke="var(--muted)" stroke-width="1.5"/>`;
+  for (let t = 0; t <= 4; t++) {
+    g += `<line x1="${xOf(t)}" y1="${Y - 4}" x2="${xOf(t)}" y2="${Y + 4}" stroke="var(--muted)"/>
+          <text class="small" x="${xOf(t)}" y="${Y + 66}" text-anchor="middle">08:00:0${t}</text>`;
+  }
+  // Watermark marker (solid) and last marker (dashed).
+  const wx = xOf(T_OF(s.wm));
+  const wmChanged = prev && prev.wm !== s.wm;
+  g += `<line x1="${wx}" y1="22" x2="${wx}" y2="${Y + 14}" stroke="var(--wm)" stroke-width="${wmChanged ? 4 : 2.5}"/>
+        <text x="${Math.max(wx, 70)}" y="15" text-anchor="middle" style="fill:var(--wm);font-weight:${wmChanged ? 700 : 400}">watermark ${s.wm}${wmChanged ? " ▲" : ""}</text>`;
+  if (last) {
+    const lx = xOf(T_OF(last));
+    const lastChanged = !prev || lastOf(prev) !== last;
+    g += `<line x1="${lx}" y1="${Y - 13}" x2="${lx}" y2="${Y + 13}" stroke="var(--last)" stroke-width="${lastChanged ? 3.5 : 2}" stroke-dasharray="5 3"/>
+          <text x="${lx}" y="${Y + 88}" text-anchor="middle" style="fill:var(--last);font-weight:${lastChanged ? 700 : 400}">last ${last}${lastChanged ? " ▲" : ""}</text>`;
+  }
+  // Commands.
+  // Alternate commands put their labels one row further out, so neighbours don't collide.
+  const order = Object.keys(CMDS).sort((a, b) => CMDS[a].t - CMDS[b].t);
+  for (const [w, st] of Object.entries(s.cmd)) {
+    const cx = xOf(CMDS[w].t), dy = order.indexOf(w) % 2 ? 15 : 0;
+    const changed = prev && prev.cmd[w] !== st;
+    if (changed) g += `<circle cx="${cx}" cy="${Y}" r="15" fill="none" stroke="var(--hl)" stroke-width="2.5"/>`;
+    g += glyph(st, cx, Y);
+    g += `<text x="${cx}" y="${Y - 21 - dy}" text-anchor="middle" style="font-weight:${changed ? 700 : 400}">${CMDS[w].name}</text>
+          <text class="small" x="${cx}" y="${Y + 29 + dy}" text-anchor="middle" style="fill:var(--fg)">${STATES[st]}${changed ? " *" : ""}</text>`;
+  }
+  svg.innerHTML = g;
+
+  const parts = [`Watermark ${s.wm}${wmChanged ? " (raised)" : ""}.`];
+  parts.push(last ? `Latest effect's last: ${last}; names at or left of it (shaded) are decided.` : "No effects yet.");
+  if (s.list) parts.push(`Dashed bar: range listed this step, ${s.list.after ? "after " + s.list.after : "from the start"} up to ${s.list.upto}.`);
+  const cs = Object.entries(s.cmd).map(([w, st]) => `${CMDS[w].name} ${STATES[st]}`);
+  if (cs.length) parts.push("Commands: " + cs.join(", ") + ".");
+  parts.push("Ringed, with *: changed this step.");
+  document.getElementById("linekey").textContent = parts.join(" ");
+}
+
+function renderBucket(s, prev) {
+  const before = prev ? Object.fromEntries(bucket(prev).map(r => [r.key, r.val])) : null;
+  document.getElementById("bucket").innerHTML = bucket(s).map(r => {
+    const mark = !before ? "" : !(r.key in before) ? "new" : before[r.key] !== r.val ? "changed" : "";
+    return `<tr class="${mark}"><td class="k">${esc(r.key)}${mark ? `<span class="badge">${mark}</span>` : ""}</td><td class="v">${esc(r.val)}</td></tr>`;
+  }).join("");
+}
+
+function renderActors(s, prev) {
+  document.getElementById("actors").innerHTML = ACTORS.map(a => {
+    const changed = prev && prev.act[a] !== s.act[a];
+    const label = a.startsWith("P") ? `Producer ${a}` : `Writer ${a}`;
+    const name = a in CMDS && a in s.cmd ? ` <span class="mono">${CMDS[a].name}</span>` : "";
+    const crashed = s.act[a].startsWith("Crashed");
+    return `<div class="actor${changed ? " changed" : ""}${crashed ? " crashed" : ""}">
+      <span class="name">${label}${name}</span>${changed ? '<span class="badge">updated</span>' : ""}
+      <span class="st">${esc(s.act[a])}</span></div>`;
+  }).join("");
+}
+
+function renderExplain(s, i) {
+  const reqs = s.reqs.length
+    ? `<ul class="reqs" aria-label="Requests this step">${s.reqs.map(([who, r]) => `<li><span class="who">${who}:</span> ${esc(r)}</li>`).join("")}</ul>`
+    : "";
+  document.getElementById("explain").innerHTML =
+    `<div class="clock">Clock ${s.clock} · lag 1 s</div><h2>${i + 1}. ${s.title}</h2>${s.text}${reqs}`;
+}
+
+let cur = 0;
+function render() {
+  const s = STEPS[cur], prev = cur > 0 ? STEPS[cur - 1] : null;
+  renderExplain(s, cur);
+  renderLine(s, prev);
+  renderBucket(s, prev);
+  renderActors(s, prev);
+  document.getElementById("counter").textContent = `Step ${cur + 1} of ${STEPS.length}`;
+  document.getElementById("back").disabled = cur === 0;
+  document.getElementById("next").disabled = cur === STEPS.length - 1;
+}
+function go(d) {
+  const n = Math.min(STEPS.length - 1, Math.max(0, cur + d));
+  if (n !== cur) { cur = n; render(); }
+}
+document.getElementById("back").addEventListener("click", () => go(-1));
+document.getElementById("next").addEventListener("click", () => go(1));
+window.addEventListener("resize", () => renderLine(STEPS[cur], cur > 0 ? STEPS[cur - 1] : null));
+document.addEventListener("keydown", e => {
+  if (e.altKey || e.ctrlKey || e.metaKey) return;
+  if (e.key === "ArrowLeft") { go(-1); e.preventDefault(); }
+  if (e.key === "ArrowRight") { go(1); e.preventDefault(); }
+});
+
+document.getElementById("legend").innerHTML = Object.entries(STATES).map(([k, label]) =>
+  `<li><svg viewBox="0 0 24 24" aria-hidden="true">${glyph(k, 12, 12)}</svg>${label}</li>`).join("") +
+  `<li><svg viewBox="0 0 24 24" aria-hidden="true"><line x1="12" y1="1" x2="12" y2="23" stroke="var(--wm)" stroke-width="2.5"/></svg>watermark (solid)</li>
+   <li><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="0" y="0" width="12" height="24" fill="var(--band)"/><line x1="12" y1="1" x2="12" y2="23" stroke="var(--last)" stroke-width="2" stroke-dasharray="4 3"/></svg>latest effect's last (dashed); shaded = decided</li>
+   <li><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="1" y="7" width="22" height="10" rx="3" fill="var(--list)" stroke="var(--wm)" stroke-dasharray="4 3"/></svg>LIST range</li>`;
+
+render();
+</script>
+</body>
+</html>
