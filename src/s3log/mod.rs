@@ -24,6 +24,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::Context;
 use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt};
+use rand::Rng;
 use object_store::aws::{AmazonS3Builder, S3ConditionalPut};
 use object_store::{ObjectStore, RetryConfig};
 use serde::{Deserialize, Serialize};
@@ -343,16 +344,24 @@ pub struct Replica<S> {
     log: S3Log,
     state: Mutex<S>,
     applied: Mutex<Applied>,
+    /// The watermark as a writer driving this replica last read it: see `drive`.
+    wm: Mutex<Watermark>,
     pub stats: Stats,
 }
 
 impl<S: StateMachine> Replica<S> {
     /// Starts applying effects from the first. Aborting the handle stops the replica.
     pub fn start(log: S3Log, state: S, producer: bool) -> (Arc<Self>, AbortHandle) {
-        let applied = Applied { next: 1, last: String::new(), waiters: BTreeMap::new() };
-        let replica = Arc::new(Self { log, state: Mutex::new(state), applied: Mutex::new(applied), stats: Stats::default() });
+        let replica = Self::passive(log, state);
         let task = tokio::spawn(replica.clone().run(producer));
         (replica, task.abort_handle())
+    }
+
+    /// A replica that applies effects only when its writer drives it: see `drive`.
+    pub fn passive(log: S3Log, state: S) -> Arc<Self> {
+        let applied = Applied { next: 1, last: String::new(), waiters: BTreeMap::new() };
+        let wm = Mutex::new((String::new(), None));
+        Arc::new(Self { log, state: Mutex::new(state), applied: Mutex::new(applied), wm, stats: Stats::default() })
     }
 
     pub fn state(&self) -> S {
@@ -367,20 +376,64 @@ impl<S: StateMachine> Replica<S> {
 
     /// Resolves once an applied effect covers `name`: `Ran` if it ran it, else `Dead`.
     pub async fn wait_outcome(&self, name: &str) -> anyhow::Result<Outcome> {
-        let applied = {
-            let mut a = self.applied.lock().unwrap();
-            if name > a.last.as_str() {
-                let (tx, rx) = oneshot::channel();
-                a.waiters.entry(name.to_string()).or_default().push(tx);
-                Err(rx)
-            } else {
-                Ok(a.next - 1)
+        match self.register(name) {
+            Ok(rx) => Ok(rx.await?),
+            Err(n) => self.log.find(name, n).await,
+        }
+    }
+
+    /// A receiver for `name`'s outcome, or, if an applied effect already covers it, the
+    /// latest applied effect.
+    fn register(&self, name: &str) -> Result<oneshot::Receiver<Outcome>, u64> {
+        let mut a = self.applied.lock().unwrap();
+        if name > a.last.as_str() {
+            let (tx, rx) = oneshot::channel();
+            a.waiters.entry(name.to_string()).or_default().push(tx);
+            Ok(rx)
+        } else {
+            Err(a.next - 1)
+        }
+    }
+
+    /// Waits for `name`'s outcome, producing when no one else seems to: after catching up,
+    /// waits a random time within `stall`, and if no new effect appeared meanwhile, runs a
+    /// producer cycle itself.
+    pub async fn drive(&self, name: &str, stall: std::ops::RangeInclusive<Duration>) -> anyhow::Result<Outcome> {
+        let mut rx = match self.register(name) {
+            Ok(rx) => rx,
+            Err(n) => return self.log.find(name, n).await,
+        };
+        let mut wm = self.wm.lock().unwrap().clone();
+        let outcome = loop {
+            let step = async {
+                self.catch_up().await?;
+                if let Ok(o) = rx.try_recv() {
+                    return anyhow::Ok(Some(o));
+                }
+                let pause = rand::thread_rng().gen_range(stall.clone());
+                sleep(pause).await;
+                if !self.follow().await? {
+                    self.produce(&mut wm).await?;
+                }
+                Ok(None)
+            };
+            match step.await {
+                Ok(Some(o)) => break o,
+                Ok(None) => {}
+                Err(e) => {
+                    warn!("s3log: {e:#}");
+                    sleep(self.log.config.poll).await;
+                }
             }
         };
-        match applied {
-            Ok(n) => self.log.find(name, n).await,
-            Err(rx) => Ok(rx.await?),
-        }
+        *self.wm.lock().unwrap() = wm;
+        Ok(outcome)
+    }
+
+    /// Applies every effect there is.
+    pub async fn catch_up(&self) -> anyhow::Result<()> {
+        while self.follow().await? {}
+        Ok(())
     }
 
     async fn run(self: Arc<Self>, producer: bool) {

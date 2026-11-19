@@ -53,6 +53,14 @@ pub struct BenchArgs {
     /// no other producers or readers.
     #[arg(long)]
     every_writer_produces: bool,
+    /// Every client drives its own replica: after its PUT it catches up, waits a random time
+    /// within --stall-ms, and if no new effect appeared meanwhile, produces itself. No other
+    /// producers or readers.
+    #[arg(long, conflicts_with = "every_writer_produces")]
+    writers_produce: bool,
+    /// The random wait for --writers-produce, as MIN-MAX milliseconds.
+    #[arg(long, default_value = "100-300")]
+    stall_ms: String,
     /// Clients submit without waiting for outcomes.
     #[arg(long)]
     no_wait: bool,
@@ -77,6 +85,8 @@ pub struct BenchConfig {
     pub output: Option<std::path::PathBuf>,
     pub no_wait: bool,
     pub every_writer_produces: bool,
+    /// See `--writers-produce`: the random wait, if on.
+    pub writers_produce: Option<std::ops::RangeInclusive<Duration>>,
 }
 
 pub async fn main(a: BenchArgs) -> anyhow::Result<bool> {
@@ -97,8 +107,14 @@ pub async fn main(a: BenchArgs) -> anyhow::Result<bool> {
         output: a.output,
         no_wait: a.no_wait,
         every_writer_produces: a.every_writer_produces,
+        writers_produce: a.writers_produce.then(|| stall(&a.stall_ms)).transpose()?,
     };
     run(log, cfg).await
+}
+
+fn stall(ms: &str) -> anyhow::Result<std::ops::RangeInclusive<Duration>> {
+    let (lo, hi) = ms.split_once('-').ok_or_else(|| anyhow::anyhow!("--stall-ms is MIN-MAX"))?;
+    Ok(Duration::from_millis(lo.parse()?)..=Duration::from_millis(hi.parse()?))
 }
 
 const KEYS: u32 = 100;
@@ -131,12 +147,18 @@ struct Sample {
 }
 
 pub async fn run(log: S3Log, cfg: BenchConfig) -> anyhow::Result<bool> {
-    let (n_producers, n_readers) = if cfg.every_writer_produces { (cfg.clients, 0) } else { (cfg.producers, cfg.readers) };
-    anyhow::ensure!(n_producers > 0 && (n_readers > 0 || cfg.every_writer_produces), "need a producer and a reader");
+    let (n_producers, n_readers) = match (cfg.every_writer_produces, &cfg.writers_produce) {
+        (true, _) => (cfg.clients, 0),
+        (_, Some(_)) => (0, 0),
+        _ => (cfg.producers, cfg.readers),
+    };
+    anyhow::ensure!(cfg.writers_produce.is_some() || n_producers > 0 && (n_readers > 0 || cfg.every_writer_produces), "need a producer and a reader");
     let lag = log.config.lag;
     let wait = 5 * lag + Duration::from_secs(if cfg.no_wait { 300 } else { 10 });
     let producers: Vec<_> = (0..n_producers).map(|_| Replica::start(log.clone(), Counters::default(), true)).collect();
     let readers: Vec<_> = (0..n_readers).map(|_| Replica::start(log.clone(), Counters::default(), false).0).collect();
+    let n_drivers = if cfg.writers_produce.is_some() { cfg.clients } else { 0 };
+    let drivers: Vec<_> = (0..n_drivers).map(|_| Replica::passive(log.clone(), Counters::default())).collect();
     if let Some(after) = cfg.kill_producer_after {
         let producers = producers.clone();
         tokio::spawn(async move {
@@ -151,8 +173,14 @@ pub async fn run(log: S3Log, cfg: BenchConfig) -> anyhow::Result<bool> {
     let deadline = t0 + cfg.duration;
     let clients: Vec<_> = (0..cfg.clients)
         .map(|c| {
-            let reader = if cfg.every_writer_produces { producers[c].0.clone() } else { readers[c % readers.len()].clone() };
-            let (log, slow, no_wait) = (log.clone(), cfg.slow_frac, cfg.no_wait);
+            let reader = if cfg.every_writer_produces {
+                producers[c].0.clone()
+            } else if cfg.writers_produce.is_some() {
+                drivers[c].clone()
+            } else {
+                readers[c % readers.len()].clone()
+            };
+            let (log, slow, no_wait, stall) = (log.clone(), cfg.slow_frac, cfg.no_wait, cfg.writers_produce.clone());
             tokio::spawn(async move {
                 let mut samples = Vec::new();
                 while Instant::now() < deadline {
@@ -165,7 +193,15 @@ pub async fn run(log: S3Log, cfg: BenchConfig) -> anyhow::Result<bool> {
                     let submit = log.submit(json!({"key": format!("k{key}"), "add": add}).to_string().into_bytes(), pause).await;
                     let ack = start.elapsed();
                     let outcome = match &submit {
-                        Submit::Acked(n) | Submit::Unknown(n) if !no_wait => timeout(wait, reader.wait_outcome(n)).await.ok().and_then(Result::ok),
+                        Submit::Acked(n) | Submit::Unknown(n) if !no_wait => {
+                            let outcome = async {
+                                match &stall {
+                                    Some(stall) => reader.drive(n, stall.clone()).await,
+                                    None => reader.wait_outcome(n).await,
+                                }
+                            };
+                            timeout(wait, outcome).await.ok().and_then(Result::ok)
+                        }
                         _ => None,
                     };
                     samples.push(Sample { submit, outcome, ack, done: start.elapsed() });
@@ -188,8 +224,14 @@ pub async fn run(log: S3Log, cfg: BenchConfig) -> anyhow::Result<bool> {
         }
         anyhow::ensure!(t.elapsed() < wait, "drain: final command not acked");
     };
-    let follower = readers.first().unwrap_or(&producers[0].0);
-    let fin_outcome = timeout(wait, follower.wait_outcome(&fin)).await;
+    let follower = readers.first().or(producers.first().map(|p| &p.0)).or(drivers.first()).unwrap();
+    let fin_outcome = timeout(wait, async {
+        match &cfg.writers_produce {
+            Some(stall) => follower.drive(&fin, stall.clone()).await,
+            None => follower.wait_outcome(&fin).await,
+        }
+    })
+    .await;
     anyhow::ensure!(matches!(fin_outcome, Ok(Ok(Outcome::Ran(_)))), "drain: final command did not run: {fin_outcome:?}");
     println!("drained in {:.2?}", t.elapsed());
 
@@ -264,7 +306,11 @@ pub async fn run(log: S3Log, cfg: BenchConfig) -> anyhow::Result<bool> {
     if replay.0.values().sum::<i64>() != added {
         fails.push(format!("counters sum to {}, commands add {added}", replay.0.values().sum::<i64>()));
     }
-    let live: Vec<_> = producers.iter().filter(|(_, h)| !h.is_finished()).map(|(r, _)| r).chain(&readers).collect();
+    // Only writers move their replicas along, so bring them up to date first.
+    for r in &drivers {
+        r.catch_up().await?;
+    }
+    let live: Vec<_> = producers.iter().filter(|(_, h)| !h.is_finished()).map(|(r, _)| r).chain(&readers).chain(&drivers).collect();
     for (i, r) in live.iter().enumerate() {
         let t = Instant::now();
         while r.progress().0 <= effects.len() as u64 && t.elapsed() < wait {
@@ -297,6 +343,11 @@ pub async fn run(log: S3Log, cfg: BenchConfig) -> anyhow::Result<bool> {
         let total = |f: fn(&Stats) -> &AtomicU64| producers.iter().map(|(p, _)| f(&p.stats).load(Relaxed)).sum::<u64>();
         println!("  {} producers: {} effects written, {} found identical, {} races lost", producers.len(), total(|s| &s.written), total(|s| &s.same), total(|s| &s.races_lost));
     }
+    if !drivers.is_empty() {
+        let total = |f: fn(&Stats) -> &AtomicU64| drivers.iter().map(|r| f(&r.stats).load(Relaxed)).sum::<u64>();
+        let busy = drivers.iter().filter(|r| r.stats.cycles.load(Relaxed) > 0).count();
+        println!("  {} writer-producers ({busy} produced): {} effects written, {} found identical, {} races lost, {} cycles", drivers.len(), total(|s| &s.written), total(|s| &s.same), total(|s| &s.races_lost), total(|s| &s.cycles));
+    }
     for (i, (p, h)) in producers.iter().enumerate().take(5) {
         let [written, same, lost] = [&p.stats.written, &p.stats.same, &p.stats.races_lost].map(|s| s.load(Relaxed));
         let killed = if h.is_finished() { " (killed)" } else { "" };
@@ -311,7 +362,7 @@ pub async fn run(log: S3Log, cfg: BenchConfig) -> anyhow::Result<bool> {
     println!("latency ms submit->result: {}", percentiles(&mut done_ms));
     if let Some(path) = &cfg.output {
         let report = json!({
-            "clients": cfg.clients, "producers": n_producers, "lag_ms": lag.as_millis() as u64, "secs": secs,
+            "clients": cfg.clients, "producers": n_producers.max(n_drivers), "lag_ms": lag.as_millis() as u64, "secs": secs,
             "acked": acked, "unknown": unknown, "ran": n_ran, "dead": n_dead, "timeouts": timeouts,
             "commands": txns, "commands_per_sec": txns as f64 / secs, "effect_sizes": effects.iter().map(|fx| fx.txns.len()).collect::<Vec<_>>(),
             "ack_ms": ack_ms, "done_ms": done_ms, "pass": fails.is_empty(),
@@ -339,7 +390,16 @@ mod tests {
     async fn end_to_end() {
         let config = Config { lag: Duration::from_millis(200), poll: Duration::from_millis(10), max_batch: 50 };
         let log = S3Log::new(super::super::memory(), "test", config);
-        let cfg = BenchConfig { clients: 20, producers: 2, readers: 1, duration: Duration::from_secs(2), kill_producer_after: None, slow_frac: 0.2, output: None, no_wait: false, every_writer_produces: false };
+        let cfg = BenchConfig { clients: 20, producers: 2, readers: 1, duration: Duration::from_secs(2), kill_producer_after: None, slow_frac: 0.2, output: None, no_wait: false, every_writer_produces: false, writers_produce: None };
+        assert!(run(log, cfg).await.unwrap());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn end_to_end_writers_produce() {
+        let config = Config { lag: Duration::from_millis(200), poll: Duration::from_millis(10), max_batch: 50 };
+        let log = S3Log::new(super::super::memory(), "test", config);
+        let stall = Some(Duration::from_millis(10)..=Duration::from_millis(30));
+        let cfg = BenchConfig { clients: 20, producers: 0, readers: 0, duration: Duration::from_secs(2), kill_producer_after: None, slow_frac: 0.2, output: None, no_wait: false, every_writer_produces: false, writers_produce: stall };
         assert!(run(log, cfg).await.unwrap());
     }
 }
