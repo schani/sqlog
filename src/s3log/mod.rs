@@ -339,13 +339,25 @@ struct Applied {
     waiters: BTreeMap<String, Vec<oneshot::Sender<Outcome>>>,
 }
 
+/// What a writer driving a replica has learned: see `Replica::drive`.
+#[derive(Clone)]
+struct Pace {
+    /// The watermark as last read or written.
+    wm: Watermark,
+    /// Average time between effects, as this writer saw them appear.
+    gap: Duration,
+    /// When this writer last saw a new effect, and the next effect then.
+    seen_at: std::time::Instant,
+    seen_next: u64,
+}
+
 /// A state machine following the effects; a producer also writes them.
 pub struct Replica<S> {
     log: S3Log,
     state: Mutex<S>,
     applied: Mutex<Applied>,
-    /// The watermark as a writer driving this replica last read it: see `drive`.
-    wm: Mutex<Watermark>,
+    /// What the writer driving this replica has learned: see `drive`.
+    pace: Mutex<Pace>,
     pub stats: Stats,
 }
 
@@ -360,8 +372,8 @@ impl<S: StateMachine> Replica<S> {
     /// A replica that applies effects only when its writer drives it: see `drive`.
     pub fn passive(log: S3Log, state: S) -> Arc<Self> {
         let applied = Applied { next: 1, last: String::new(), waiters: BTreeMap::new() };
-        let wm = Mutex::new((String::new(), None));
-        Arc::new(Self { log, state: Mutex::new(state), applied: Mutex::new(applied), wm, stats: Stats::default() })
+        let pace = Mutex::new(Pace { wm: (String::new(), None), gap: Duration::from_millis(100), seen_at: std::time::Instant::now(), seen_next: 1 });
+        Arc::new(Self { log, state: Mutex::new(state), applied: Mutex::new(applied), pace, stats: Stats::default() })
     }
 
     pub fn state(&self) -> S {
@@ -395,26 +407,37 @@ impl<S: StateMachine> Replica<S> {
         }
     }
 
-    /// Waits for `name`'s outcome, producing when no one else seems to: after catching up,
-    /// waits a random time within `stall`, and if no new effect appeared meanwhile, runs a
-    /// producer cycle itself.
+    /// Waits for `name`'s outcome, producing only when no one else seems to. After catching
+    /// up, waits two to three times the usual gap between effects (within `stall`); if
+    /// meanwhile neither a new effect appeared nor the watermark moved (producers raise it
+    /// every cycle), runs a producer cycle itself.
     pub async fn drive(&self, name: &str, stall: std::ops::RangeInclusive<Duration>) -> anyhow::Result<Outcome> {
         let mut rx = match self.register(name) {
             Ok(rx) => rx,
             Err(n) => return self.log.find(name, n).await,
         };
-        let mut wm = self.wm.lock().unwrap().clone();
+        let mut p = self.pace.lock().unwrap().clone();
         let outcome = loop {
             let step = async {
                 self.catch_up().await?;
+                self.observe(&mut p);
                 if let Ok(o) = rx.try_recv() {
                     return anyhow::Ok(Some(o));
                 }
-                let pause = rand::thread_rng().gen_range(stall.clone());
-                sleep(pause).await;
-                if !self.follow().await? {
-                    self.produce(&mut wm).await?;
+                if p.wm.0.is_empty() {
+                    p.wm = self.log.watermark().await?;
                 }
+                let pause = p.gap.mul_f64(rand::thread_rng().gen_range(2.0..3.0)).clamp(*stall.start(), *stall.end());
+                sleep(pause).await;
+                if self.follow().await? {
+                    return Ok(None);
+                }
+                let wm = self.log.watermark().await?;
+                if wm.0 != p.wm.0 {
+                    p.wm = wm; // a producer is at work
+                    return Ok(None);
+                }
+                self.produce(&mut p.wm).await?;
                 Ok(None)
             };
             match step.await {
@@ -426,8 +449,19 @@ impl<S: StateMachine> Replica<S> {
                 }
             }
         };
-        *self.wm.lock().unwrap() = wm;
+        *self.pace.lock().unwrap() = p;
         Ok(outcome)
+    }
+
+    /// Folds the effects applied since the last call into the average gap between effects.
+    fn observe(&self, p: &mut Pace) {
+        let next = self.progress().0;
+        if next > p.seen_next {
+            let now = std::time::Instant::now();
+            let gap = (now - p.seen_at) / (next - p.seen_next) as u32;
+            p.gap = p.gap.mul_f64(0.8) + gap.mul_f64(0.2);
+            (p.seen_at, p.seen_next) = (now, next);
+        }
     }
 
     /// Applies every effect there is.
